@@ -178,6 +178,13 @@ export interface GitCommandOutput {
   stderr: string;
 }
 
+export interface AutoPushResponse {
+  pushed: boolean;
+  sha: string | null;
+  auto_push_last_at: string | null;
+  auto_push_last_error: string | null;
+}
+
 /**
  * Encodes a workspace-relative path for URL path segments (`/api/projects/{pid}/files/{*path}`).
  * Preserves `/` separators and percent-encodes each path segment.
@@ -551,6 +558,13 @@ export function gitPush(repo: string): Promise<GitCommandOutput> {
   });
 }
 
+export function triggerAutoPush(pid?: number): Promise<AutoPushResponse> {
+  return requestJson<AutoPushResponse>(`${projectApiBase(pid)}/git/auto-push`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
 export function gitSubmoduleUpdate(path?: string, remote = true): Promise<GitCommandOutput> {
   const body: { path?: string; remote: boolean } = { remote };
   if (path) body.path = path;
@@ -653,6 +667,11 @@ export interface Project {
   commit_name: string | null;
   /** caller's per-project commit author e-mail override */
   commit_email: string | null;
+  /** 0 = disabled, or seconds in 60..=86400 */
+  auto_push_interval_secs: number;
+  auto_push_message: string;
+  auto_push_last_at: string | null;
+  auto_push_last_error: string | null;
   created_at: string;
 }
 
@@ -672,8 +691,34 @@ export interface CreateProjectRequest {
   branch?: string;
   username?: string;
   token?: string;
+  template_id?: string;
   create_remote?: CreateRemote;
   compiler?: TexCompiler;
+}
+
+export interface ScanProjectRequest {
+  remote_url: string;
+  branch?: string;
+  username?: string;
+  token?: string;
+}
+
+export interface MatchedAccountInfo {
+  id: number;
+  provider: "github" | "gitlab";
+  base_url: string;
+  login: string;
+}
+
+export interface ScanProjectResult {
+  branch: string;
+  is_empty: boolean;
+  file_count: number;
+  has_tex_files: boolean;
+  tex_files: string[];
+  roots: string[];
+  detected_compiler: FixedTexCompiler | null;
+  matched_account: MatchedAccountInfo | null;
 }
 
 export interface UpdateProjectRequest {
@@ -682,6 +727,8 @@ export interface UpdateProjectRequest {
   token?: string | null;
   compiler?: TexCompiler;
   main_files?: string[];
+  auto_push_interval_secs?: number;
+  auto_push_message?: string;
 }
 
 export interface ProjectMember {
@@ -696,6 +743,13 @@ export function listProjects(): Promise<Project[]> {
 
 export function createProject(body: CreateProjectRequest): Promise<Project> {
   return requestJson<Project>("/api/projects", { method: "POST", body: JSON.stringify(body) });
+}
+
+export function scanProject(body: ScanProjectRequest): Promise<ScanProjectResult> {
+  return requestJson<ScanProjectResult>("/api/projects/scan", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 }
 
 export function getProject(pid: number): Promise<Project> {

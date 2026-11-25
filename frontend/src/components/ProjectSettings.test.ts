@@ -5,6 +5,7 @@ import type { Project, User } from "../api";
 import { ProjectSettings } from "./ProjectSettings";
 
 const updateProjectCommitIdentityMock = vi.fn();
+const updateProjectMock = vi.fn();
 
 vi.mock("../api", async (orig) => ({
   ...(await orig<typeof import("../api")>()),
@@ -12,6 +13,7 @@ vi.mock("../api", async (orig) => ({
   listProjectRoots: () => Promise.resolve([]),
   getDictionary: () => Promise.resolve({ words: [], disabled_rules: [] }),
   updateProjectCommitIdentity: (...args: unknown[]) => updateProjectCommitIdentityMock(...args),
+  updateProject: (...args: unknown[]) => updateProjectMock(...args),
 }));
 
 const sampleUser: User = {
@@ -38,6 +40,10 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     account_id: null,
     commit_name: null,
     commit_email: null,
+    auto_push_interval_secs: 0,
+    auto_push_message: "Auto-save: {files}",
+    auto_push_last_at: null,
+    auto_push_last_error: null,
     created_at: "2026-11-25T12:00:00Z",
     ...overrides,
   };
@@ -64,6 +70,7 @@ describe("ProjectSettings Git author per project", () => {
       };
     }
     updateProjectCommitIdentityMock.mockReset();
+    updateProjectMock.mockReset();
     container = document.createElement("div");
     document.body.appendChild(container);
   });
@@ -180,5 +187,71 @@ describe("ProjectSettings Git author per project", () => {
       commit_name: null,
       commit_email: null,
     });
+  });
+
+  it("shows Auto-Push settings for owner only and saves interval and template", async () => {
+    const onProjectChanged = vi.fn();
+    render(
+      h(ProjectSettings, {
+        project: makeProject({ my_role: "editor" }),
+        user: sampleUser,
+        onClose: () => undefined,
+        onProjectChanged,
+      }),
+      container
+    );
+    await flushUi();
+    expect(container.textContent).not.toContain("Auto-Commit-Nachricht");
+
+    const ownerProject = makeProject({
+      my_role: "owner",
+      auto_push_last_error: "Konflikt in main.tex",
+    });
+    updateProjectMock.mockResolvedValue({
+      ...ownerProject,
+      auto_push_interval_secs: 300,
+      auto_push_message: "WIP: {files} ({count})",
+      auto_push_last_error: null,
+    });
+    render(
+      h(ProjectSettings, {
+        project: ownerProject,
+        user: sampleUser,
+        onClose: () => undefined,
+        onProjectChanged,
+      }),
+      container
+    );
+    await flushUi();
+    expect(container.textContent).toContain("Konflikt in main.tex");
+
+    const intervalSelect = Array.from(container.querySelectorAll("select")).find((s) =>
+      s.textContent?.includes("Alle 5 Minuten")
+    );
+    const msgInput = container.querySelector<HTMLInputElement>('input[placeholder="Auto-save: {files}"]');
+    expect(intervalSelect).toBeDefined();
+    expect(msgInput).not.toBeNull();
+
+    intervalSelect!.value = "300";
+    intervalSelect!.dispatchEvent(new Event("change", { bubbles: true }));
+    msgInput!.value = " WIP: {files} ({count}) ";
+    msgInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    await flushUi();
+
+    const submitBtn = msgInput!.closest("form")!.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    expect(submitBtn.disabled).toBe(false);
+    submitBtn.click();
+    await flushUi();
+
+    expect(updateProjectMock).toHaveBeenCalledWith(1, {
+      auto_push_interval_secs: 300,
+      auto_push_message: "WIP: {files} ({count})",
+    });
+    expect(onProjectChanged).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auto_push_interval_secs: 300,
+        auto_push_message: "WIP: {files} ({count})",
+      })
+    );
   });
 });

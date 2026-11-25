@@ -31,7 +31,8 @@ use tokio::sync::watch;
 use crate::{
     accounts,
     auth::{AuthSession, User},
-    compile::{Compiler, Engine, Setting},
+    compile::{self, Compiler, Engine, Setting},
+    detect,
     docs::{self, Docs},
     error::ApiError,
     events::{self, Events},
@@ -42,7 +43,9 @@ use crate::{
 };
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
+const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_GIT_USERNAME: &str = "oauth2";
+static SCAN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 
 /// Encrypts stored git tokens. Blob layout: 12-byte random nonce || ciphertext.
 pub struct Secrets(ChaCha20Poly1305);
@@ -257,6 +260,14 @@ pub struct ProjectInfo {
     pub commit_name: Option<String>,
     /// caller's per-project commit author e-mail override (`None` = profile/default rule)
     pub commit_email: Option<String>,
+    /// periodic server-side auto-commit & push interval in seconds; 0 = off
+    pub auto_push_interval_secs: i64,
+    /// commit message template for auto-push
+    pub auto_push_message: String,
+    /// RFC 3339 timestamp of the last successful auto-push
+    pub auto_push_last_at: Option<String>,
+    /// error message of the last failed auto-push (`None` = ok)
+    pub auto_push_last_error: Option<String>,
     pub created_at: String,
 }
 
@@ -273,6 +284,8 @@ macro_rules! select_project {
                 CASE WHEN p.compiler_auto THEN 'auto' ELSE p.compiler END AS compiler,
                 p.main_files, p.account_id,
                 ci.commit_name, ci.commit_email,
+                p.auto_push_interval_secs, p.auto_push_message,
+                p.auto_push_last_at, p.auto_push_last_error,
                 strftime('%Y-%m-%dT%H:%M:%SZ', p.created_at) AS created_at
              FROM projects p JOIN users o ON o.id = p.owner_id
              LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = ?1
@@ -301,12 +314,13 @@ impl AppState {
 
     /// Git environment from the DB (token decrypted).
     async fn load_remote(&self, pid: i64) -> Result<Remote, ApiError> {
-        let (username, token): (String, Option<Vec<u8>>) =
-            sqlx::query_as("SELECT git_username, token_enc FROM projects WHERE id = ?")
+        let (remote_url, username, token): (String, String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT remote_url, git_username, token_enc FROM projects WHERE id = ?")
                 .bind(pid)
                 .fetch_one(&self.db)
                 .await
                 .map_err(ApiError::internal)?;
+        let host = git::https_host(&remote_url);
         let creds = token.and_then(|blob| {
             let token = self.secrets.decrypt(&blob);
             if token.is_none() {
@@ -315,6 +329,7 @@ impl AppState {
             Some(Creds {
                 username,
                 token: token?,
+                host: host.clone(),
             })
         });
         let key = self.project_dir(pid).join("ssh/id_ed25519");
@@ -454,34 +469,293 @@ pub struct NewProject {
     branch: Option<String>,
     username: Option<String>,
     token: Option<String>,
+    /// optional template applied when connecting an existing repo without `.tex` files
+    template_id: Option<String>,
     /// … or one undertree creates
     create_remote: Option<accounts::CreateRemote>,
     /// default `auto`
     compiler: Option<Setting>,
 }
 
-/// Clones `url` into `dir/repo`, returns the checked-out branch.
-async fn clone(
-    dir: &FsPath,
+#[derive(Deserialize)]
+pub struct ScanProject {
+    remote_url: String,
+    branch: Option<String>,
+    username: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ScanResult {
+    branch: String,
+    is_empty: bool,
+    file_count: usize,
+    has_tex_files: bool,
+    tex_files: Vec<String>,
+    roots: Vec<String>,
+    detected_compiler: Option<Engine>,
+    matched_account: Option<accounts::MatchedAccountInfo>,
+}
+
+pub(crate) struct ResolvedCreds {
+    pub(crate) host: Option<String>,
+    pub(crate) username: String,
+    pub(crate) token: Option<String>,
+    pub(crate) matched_account: Option<accounts::MatchedAccountInfo>,
+    pub(crate) used_auto_token: bool,
+}
+
+impl ResolvedCreds {
+    pub(crate) fn remote(&self, allow_file: bool) -> Remote {
+        Remote {
+            creds: self.token.clone().map(|token| Creds {
+                username: self.username.clone(),
+                token,
+                host: self.host.clone(),
+            }),
+            allow_file,
+            ssh: None,
+        }
+    }
+}
+
+pub(crate) async fn resolve_connect_creds(
+    app: &AppState,
+    user_id: i64,
     url: &str,
-    b: &NewProject,
+    manual_username: Option<String>,
+    manual_token: Option<String>,
+) -> Result<ResolvedCreds, ApiError> {
+    let host = git::https_host(url);
+    let manual_tok = manual_token.filter(|t| !t.is_empty());
+    if let Some(tok) = manual_tok {
+        return Ok(ResolvedCreds {
+            host,
+            username: non_empty(manual_username).unwrap_or_else(|| DEFAULT_GIT_USERNAME.to_owned()),
+            token: Some(tok),
+            matched_account: None,
+            used_auto_token: false,
+        });
+    }
+    if let Some(matched) = accounts::match_for_url(app, user_id, url).await? {
+        return Ok(ResolvedCreds {
+            host,
+            username: non_empty(manual_username).unwrap_or(matched.username),
+            token: Some(matched.token),
+            matched_account: Some(matched.info),
+            used_auto_token: true,
+        });
+    }
+    Ok(ResolvedCreds {
+        host,
+        username: non_empty(manual_username).unwrap_or_else(|| DEFAULT_GIT_USERNAME.to_owned()),
+        token: None,
+        matched_account: None,
+        used_auto_token: false,
+    })
+}
+
+fn scrub_tmp_path(msg: String, dir: &FsPath) -> String {
+    let prefix = dir.display().to_string();
+    if prefix.is_empty() {
+        msg
+    } else {
+        msg.replace(&prefix, "<repo>")
+    }
+}
+
+struct TempDirGuard(Option<PathBuf>);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CloneOpts<'a> {
+    url: &'a str,
+    branch: Option<&'a str>,
+    allow_file: bool,
+    shallow: bool,
+    recurse_submodules: bool,
+    timeout: Duration,
+}
+
+/// Clones `opts.url` into `dir/repo`, returning `(branch, is_empty)`.
+async fn clone_repo(
+    dir: &FsPath,
+    opts: CloneOpts<'_>,
     remote: &Remote,
-) -> Result<String, ApiError> {
+) -> Result<(String, bool), ApiError> {
     let failed = |msg: String| ApiError::new(StatusCode::BAD_GATEWAY, "git_failed", msg);
-    let branch = b.branch.as_ref().map(|br| format!("--branch={br}"));
-    let mut args = vec!["clone", "-q", "--recurse-submodules"];
-    args.extend(branch.as_deref());
-    args.extend(["--", url, "repo"]);
-    let out = tokio::time::timeout(CLONE_TIMEOUT, git::run(dir, &args, remote))
+    let branch_flag = opts.branch.map(|br| format!("--branch={br}"));
+    let mut args = vec!["clone", "-q"];
+    if opts.recurse_submodules {
+        args.push("--recurse-submodules");
+    }
+    if opts.shallow {
+        args.push("--depth=1");
+    }
+    args.extend(branch_flag.as_deref());
+    args.extend(["--", opts.url, "repo"]);
+    let out = tokio::time::timeout(opts.timeout, git::run(dir, &args, remote))
         .await
         .map_err(|_| failed("git clone timed out".into()))?
         .map_err(ApiError::internal)?;
     if !out.status.success() {
-        return Err(failed(git::explain(&String::from_utf8_lossy(&out.stderr))));
+        let explained = git::explain(&String::from_utf8_lossy(&out.stderr));
+        return Err(failed(scrub_tmp_path(explained, dir)));
     }
-    git::stdout(&dir.join("repo"), &["rev-parse", "--abbrev-ref", "HEAD"])
+    let repo_dir = dir.join("repo");
+    let has_head = git::stdout(&repo_dir, &["rev-parse", "--verify", "-q", "HEAD"])
         .await
-        .ok_or_else(|| failed("cloned repository has no HEAD".into()))
+        .is_some();
+    if !has_head {
+        let br = opts
+            .branch
+            .map(ToOwned::to_owned)
+            .or(git::stdout(&repo_dir, &["symbolic-ref", "--short", "HEAD"]).await)
+            .unwrap_or_else(|| "main".to_owned());
+        return Ok((br, true));
+    }
+    let br = git::stdout(&repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .ok_or_else(|| failed("cloned repository has no HEAD".into()))?;
+    Ok((br, false))
+}
+
+async fn clone_with_fallback(
+    dir: &FsPath,
+    opts: CloneOpts<'_>,
+    creds: &mut ResolvedCreds,
+) -> Result<(String, bool), ApiError> {
+    let remote = creds.remote(opts.allow_file);
+    match clone_repo(dir, opts, &remote).await {
+        Ok(res) => Ok(res),
+        Err(first_err) if creds.used_auto_token => {
+            let repo_dir = dir.join("repo");
+            let _ = tokio::fs::remove_dir_all(&repo_dir).await;
+            let anon = Remote {
+                creds: None,
+                allow_file: opts.allow_file,
+                ssh: None,
+            };
+            match clone_repo(dir, opts, &anon).await {
+                Ok(res) => {
+                    creds.token = None;
+                    creds.matched_account = None;
+                    creds.used_auto_token = false;
+                    Ok(res)
+                }
+                Err(_) => Err(first_err),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn count_workspace_files(root: &FsPath, cap: usize) -> std::io::Result<usize> {
+    fn walk(dir: &FsPath, count: &mut usize, cap: usize) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            if *count >= cap {
+                return Ok(());
+            }
+            let e = e?;
+            let name = e.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let ft = e.file_type()?;
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                walk(&e.path(), count, cap)?;
+            } else if ft.is_file() {
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+    let mut count = 0;
+    walk(root, &mut count, cap)?;
+    Ok(count)
+}
+
+pub async fn scan(
+    State(app): State<Arc<AppState>>,
+    auth: AuthSession,
+    Json(b): Json<ScanProject>,
+) -> Result<Json<ScanResult>, ApiError> {
+    let user = auth.user().await.ok_or_else(ApiError::unauthorized)?;
+    let _permit = SCAN_SLOTS.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "zu viele gleichzeitige Repository-Scans — bitte gleich erneut versuchen",
+        )
+    })?;
+    let url = b.remote_url.trim().to_owned();
+    validate_remote_url(&url, app.allow_file).map_err(ApiError::bad_request)?;
+    if b.branch
+        .as_deref()
+        .is_some_and(|br| br.is_empty() || br.starts_with('-'))
+    {
+        return Err(ApiError::bad_request("invalid branch"));
+    }
+    plain_field("username", b.username.as_deref())?;
+    plain_field("token", b.token.as_deref())?;
+
+    let mut creds = resolve_connect_creds(&app, user.id, &url, b.username, b.token).await?;
+    let tmp = new_tmp(&app, "scan").await?;
+    let mut guard = TempDirGuard(Some(tmp.clone()));
+    let (branch, is_empty) = clone_with_fallback(
+        &tmp,
+        CloneOpts {
+            url: &url,
+            branch: b.branch.as_deref(),
+            allow_file: app.allow_file,
+            shallow: true,
+            recurse_submodules: false,
+            timeout: SCAN_TIMEOUT,
+        },
+        &mut creds,
+    )
+    .await?;
+    let repo_dir = tmp.join("repo");
+    let (files, file_count) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        let files = compile::scan_dir_tex(&repo_dir)?;
+        let count = count_workspace_files(&repo_dir, 5000)?;
+        Ok((files, count))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
+
+    let mut tex_files: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    tex_files.sort();
+    let has_tex_files = !tex_files.is_empty();
+    let sources = detect::Sources::new(files);
+    let root_refs = sources.roots();
+    let detected_compiler = root_refs.first().map(|r| sources.engine(r).0);
+    let roots = root_refs.into_iter().map(ToOwned::to_owned).collect();
+
+    if let Some(p) = guard.0.take() {
+        let _ = tokio::fs::remove_dir_all(p).await;
+    }
+    Ok(Json(ScanResult {
+        branch,
+        is_empty,
+        file_count,
+        has_tex_files,
+        tex_files,
+        roots,
+        detected_compiler,
+        matched_account: creds.matched_account.clone(),
+    }))
 }
 
 pub async fn create(
@@ -500,7 +774,7 @@ pub async fn create(
             let info = project_info(&app, &user, pid).await?;
             return Ok((StatusCode::CREATED, Json(info)));
         }
-        (Some(url), None) => url.clone(),
+        (Some(url), None) => url.trim().to_owned(),
         _ => {
             return Err(ApiError::bad_request(
                 "give either remote_url or create_remote",
@@ -516,22 +790,122 @@ pub async fn create(
     }
     plain_field("username", b.username.as_deref())?;
     plain_field("token", b.token.as_deref())?;
-    let username = non_empty(b.username.clone()).unwrap_or_else(|| DEFAULT_GIT_USERNAME.to_owned());
-    let token = b.token.clone().filter(|t| !t.is_empty());
-    let remote = Remote {
-        creds: token.clone().map(|token| Creds {
-            username: username.clone(),
-            token,
-        }),
-        allow_file: app.allow_file,
-        ssh: None,
+
+    let mut creds = resolve_connect_creds(&app, user.id, &url, b.username, b.token).await?;
+    let mut compiler_setting = b.compiler.unwrap_or_default();
+    let template = match b
+        .template_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(tid) => Some(
+            templates::find(&app, tid, &user)
+                .await?
+                .ok_or_else(|| ApiError::bad_request(format!("unknown template {tid:?}")))?,
+        ),
+        None => None,
     };
 
     let tmp = new_tmp(&app, "clone").await?;
-    let branch = match clone(&tmp, &url, &b, &remote).await {
-        Ok(branch) => branch,
+    let (branch, is_empty) = match clone_with_fallback(
+        &tmp,
+        CloneOpts {
+            url: &url,
+            branch: b.branch.as_deref(),
+            allow_file: app.allow_file,
+            shallow: false,
+            recurse_submodules: true,
+            timeout: CLONE_TIMEOUT,
+        },
+        &mut creds,
+    )
+    .await
+    {
+        Ok(res) => res,
         Err(e) => return Err(rollback(&tmp, e).await),
     };
+
+    if let Some(ref tpl) = template {
+        let repo_dir = tmp.join("repo");
+        let existing_tex = match tokio::task::spawn_blocking({
+            let repo_dir = repo_dir.clone();
+            move || compile::scan_dir_tex(&repo_dir)
+        })
+        .await
+        {
+            Ok(Ok(files)) => files,
+            Ok(Err(e)) => return Err(rollback(&tmp, ApiError::internal(e)).await),
+            Err(e) => return Err(rollback(&tmp, ApiError::internal(e)).await),
+        };
+        if !existing_tex.is_empty() {
+            return Err(rollback(
+                &tmp,
+                ApiError::bad_request("repository already contains .tex files"),
+            )
+            .await);
+        }
+        if compiler_setting == Setting::Auto && b.compiler.is_none() {
+            compiler_setting = Setting::Fixed(tpl.compiler);
+        }
+        let engine = compiler_setting.fixed().unwrap_or(tpl.compiler);
+        let forge = creds
+            .matched_account
+            .as_ref()
+            .map(|m| m.provider)
+            .or_else(|| git::is_github(&url).then_some(accounts::Forge::Github));
+        let remote = creds.remote(app.allow_file);
+        let init_res: Result<(), ApiError> = async {
+            starter_files(&app, &repo_dir, tpl, forge, engine).await?;
+            if is_empty {
+                let target_ref = format!("refs/heads/{branch}");
+                run_git(&repo_dir, &["symbolic-ref", "HEAD", &target_ref], &remote).await?;
+            }
+            let ident = [
+                format!("user.name={}", git::ident_name(&user)),
+                format!(
+                    "user.email={}",
+                    git::author_email(&user, git::is_github(&url))
+                ),
+            ];
+            let commit_msg = format!("Add template: {}", tpl.name);
+            run_git(&repo_dir, &["add", "-A"], &remote).await?;
+            run_git(
+                &repo_dir,
+                &[
+                    "-c",
+                    &ident[0],
+                    "-c",
+                    &ident[1],
+                    "commit",
+                    "-q",
+                    "-m",
+                    &commit_msg,
+                ],
+                &remote,
+            )
+            .await?;
+            if is_empty {
+                run_git(&repo_dir, &["push", "-q", "-u", "origin", &branch], &remote).await?;
+            } else {
+                run_git(&repo_dir, &["push", "-q", "origin", &branch], &remote).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = init_res {
+            return Err(rollback(&tmp, e).await);
+        }
+    } else if is_empty {
+        return Err(rollback(
+            &tmp,
+            ApiError::bad_request(
+                "repository has no commits yet; select a template to initialize it",
+            ),
+        )
+        .await);
+    }
+
     let mut tx = match app.db.begin().await {
         Ok(tx) => tx,
         Err(e) => return Err(rollback(&tmp, ApiError::internal(e)).await),
@@ -545,15 +919,27 @@ pub async fn create(
     .bind(&url)
     .bind(&branch)
     .bind(user.id)
-    .bind(&username)
-    .bind(token.map(|t| app.secrets.encrypt(&t)))
-    .bind(b.compiler.and_then(Setting::fixed).unwrap_or_default())
-    .bind(b.compiler.unwrap_or_default() == Setting::Auto)
+    .bind(&creds.username)
+    .bind(creds.token.map(|t| app.secrets.encrypt(&t)))
+    .bind(compiler_setting.fixed().unwrap_or_default())
+    .bind(compiler_setting == Setting::Auto)
     .fetch_one(&mut *tx)
     .await;
     let pid = install(&app, &tmp, tx, inserted, user.id).await?;
     let info = project_info(&app, &user, pid).await?;
     Ok((StatusCode::CREATED, Json(info)))
+}
+
+async fn run_git(dir: &FsPath, args: &[&str], remote: &Remote) -> Result<(), ApiError> {
+    let out = tokio::time::timeout(CLONE_TIMEOUT, git::run(dir, args, remote))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "git_failed", "git timed out"))?
+        .map_err(ApiError::internal)?;
+    if !out.status.success() {
+        let err = git::explain(&String::from_utf8_lossy(&out.stderr));
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, "git_failed", err));
+    }
+    Ok(())
 }
 
 /// 24 random hex digits.
@@ -661,7 +1047,14 @@ async fn create_with_remote(
     let tmp = new_tmp(app, "create").await.map_err(left_behind)?;
     let title = format!("undertree {}", spec.repo_name.trim());
     let init = async {
-        starter_files(app, &tmp.join("repo"), &template, conn.forge, compiler).await?;
+        starter_files(
+            app,
+            &tmp.join("repo"),
+            &template,
+            Some(conn.forge),
+            compiler,
+        )
+        .await?;
         init_remote_repo(app, &tmp, &title, user, &conn, &repo, spec.account_id).await
     };
     if let Err(e) = init.await {
@@ -693,36 +1086,42 @@ async fn create_with_remote(
         .map_err(left_behind)
 }
 
-/// The files of `template` in `work`, plus `.gitignore` and CI building its main file, unless the
-/// template brings its own.
+/// Adds the files of `template` into `work` (never overwriting existing files or following
+/// symlinks), plus `.gitignore` and CI (when the forge is known) unless already present.
 async fn starter_files(
     app: &AppState,
     work: &FsPath,
     template: &templates::Template,
-    forge: accounts::Forge,
+    forge: Option<accounts::Forge>,
     compiler: Engine,
 ) -> Result<(), ApiError> {
-    templates::copy_files(app, template, work).await?;
-    let (ci_path, ci) = crate::ci::pipeline(forge, compiler, &template.main_file);
-    for (path, content) in [
-        (".gitignore", crate::ci::gitignore(&template.main_file)),
-        (ci_path, ci),
-    ] {
-        let path = work.join(path);
-        if tokio::fs::try_exists(&path)
-            .await
-            .map_err(ApiError::internal)?
-        {
-            continue;
-        }
-        tokio::fs::create_dir_all(path.parent().expect("has parent"))
-            .await
-            .map_err(ApiError::internal)?;
-        tokio::fs::write(path, content)
-            .await
-            .map_err(ApiError::internal)?;
+    templates::copy_files_no_overwrite(app, template, work).await?;
+    let mut extras: Vec<(&str, String)> =
+        vec![(".gitignore", crate::ci::gitignore(&template.main_file))];
+    if let Some(f) = forge {
+        let (ci_path, ci) = crate::ci::pipeline(f, compiler, &template.main_file);
+        extras.push((ci_path, ci));
     }
-    Ok(())
+    let work = work.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        for (path, content) in extras {
+            templates::write_confined_no_overwrite(&work, FsPath::new(path), content.as_bytes())
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.kind() == std::io::ErrorKind::AlreadyExists
+                    {
+                        ApiError::bad_request(
+                            "repository contains unsafe symlinks or colliding paths",
+                        )
+                    } else {
+                        ApiError::internal(e)
+                    }
+                })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 /// Self-hosted servers (not the pinned github.com/gitlab.com): the account's host key for
@@ -893,6 +1292,8 @@ pub struct PatchProject {
     token: Option<Option<String>>,
     compiler: Option<Setting>,
     main_files: Option<Vec<String>>,
+    auto_push_interval_secs: Option<i64>,
+    auto_push_message: Option<String>,
 }
 
 pub async fn patch(
@@ -904,6 +1305,15 @@ pub async fn patch(
     let pid = access.info.id;
     plain_field("username", b.username.as_deref())?;
     plain_field("token", b.token.as_ref().and_then(|t| t.as_deref()))?;
+    let auto_push_interval = b
+        .auto_push_interval_secs
+        .map(crate::autopush::validate_interval)
+        .transpose()?;
+    let auto_push_message = b
+        .auto_push_message
+        .as_deref()
+        .map(crate::autopush::validate_message)
+        .transpose()?;
     let main_files = match b.main_files {
         Some(files) => {
             let rt = app.runtime(pid).await?;
@@ -955,6 +1365,28 @@ pub async fn patch(
     if let Some(files) = &main_files {
         sqlx::query("UPDATE projects SET main_files = ? WHERE id = ?")
             .bind(serde_json::to_string(files).map_err(ApiError::internal)?)
+            .bind(pid)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(interval) = auto_push_interval {
+        sqlx::query(
+            "UPDATE projects
+             SET auto_push_interval_secs = ?,
+                 auto_push_last_error = CASE WHEN ? = 0 THEN NULL ELSE auto_push_last_error END
+             WHERE id = ?",
+        )
+        .bind(interval)
+        .bind(interval)
+        .bind(pid)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    if let Some(msg) = &auto_push_message {
+        sqlx::query("UPDATE projects SET auto_push_message = ? WHERE id = ?")
+            .bind(msg)
             .bind(pid)
             .execute(&mut *tx)
             .await

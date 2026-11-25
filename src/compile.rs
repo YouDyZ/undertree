@@ -672,6 +672,12 @@ fn scan_tex_limited(
     out
 }
 
+/// Scans `.tex` files below `root` on disk using the same sandboxed directory caps as compile.
+pub(crate) fn scan_dir_tex(root: &FsPath) -> io::Result<Vec<(String, String)>> {
+    let dir = Dir::open_ambient_dir(root, ambient_authority())?;
+    Ok(scan_tex(&dir, "", &|_| false))
+}
+
 /// `Ok((success, stdout+stderr))`, `Err(message)` if latexmk couldn't run or timed out.
 pub async fn latexmk(
     cwd: &FsPath,

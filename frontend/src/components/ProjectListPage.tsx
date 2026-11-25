@@ -1,8 +1,9 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import {
   type CreateProjectRequest,
   type GitAccount,
   type Project,
+  type ScanProjectResult,
   type Template,
   type TexCompiler,
   type User,
@@ -14,8 +15,16 @@ import {
   listAccounts,
   listProjects,
   listTemplates,
+  scanProject,
 } from "../api";
-import { NEW_GITHUB, NEW_GITLAB, accountOptions, repoNameFromTitle } from "../lib/accounts";
+import {
+  NEW_GITHUB,
+  NEW_GITLAB,
+  accountLabel,
+  accountOptions,
+  matchAccountForUrl,
+  repoNameFromTitle,
+} from "../lib/accounts";
 import { MEMBER_ROLE_DESCRIPTIONS, MEMBER_ROLE_LABELS } from "../lib/roles";
 import { linkClick, navigate } from "../lib/route";
 import { DEFAULT_TEMPLATE_ID, compilerBadgeLabel, pickDefaultTemplateId } from "../lib/templates";
@@ -150,6 +159,10 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
   const [templates, setTemplates] = useState<Template[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
   const [templateId, setTemplateId] = useState<string>(DEFAULT_TEMPLATE_ID);
+  const [scanResult, setScanResult] = useState<ScanProjectResult | null>(null);
+  const [scannedKey, setScannedKey] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [addTemplate, setAddTemplate] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -159,22 +172,32 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
   const connecting = accountSel === NEW_GITLAB || accountSel === NEW_GITHUB;
   const selectedTemplate = templates?.find((t) => t.id === templateId) ?? null;
 
+  const currentScanKey = `${remoteUrl.trim()}\0${branch.trim()}\0${username.trim()}\0${token}`;
+  const activeScan = scannedKey === currentScanKey ? scanResult : null;
+  const matchedAccount = useMemo(
+    () => (token ? null : matchAccountForUrl(accounts ?? [], remoteUrl)),
+    [accounts, remoteUrl, token]
+  );
+  const showConnectTemplatePicker =
+    !create && activeScan !== null && !activeScan.has_tex_files && (activeScan.is_empty || addTemplate);
+
   useEffect(() => {
-    if (!create || accounts !== null) return;
+    if (accounts !== null) return;
     listAccounts()
       .then((list) => {
         const gitAccounts = list.filter((a) => a.provider !== "zotero");
         setAccounts(gitAccounts);
-        setAccountSel(gitAccounts[0] ? String(gitAccounts[0].id) : NEW_GITLAB);
+        setAccountSel((prev) => prev || (gitAccounts[0] ? String(gitAccounts[0].id) : NEW_GITLAB));
       })
       .catch((err: unknown) => setError(errorText(err, "Konten konnten nicht geladen werden.")));
     getAuthProviders()
       .then((p) => setGithubAvailable(p.oauth.includes("github")))
       .catch(() => {});
-  }, [create, accounts]);
+  }, [accounts]);
 
+  const needsTemplates = create || (activeScan !== null && !activeScan.has_tex_files);
   useEffect(() => {
-    if (!create || templates !== null) return;
+    if (!needsTemplates || templates !== null) return;
     let active = true;
     listTemplates()
       .then((list) => {
@@ -183,7 +206,7 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
         const defId = pickDefaultTemplateId(list);
         setTemplateId(defId);
         const defTpl = list.find((t) => t.id === defId);
-        if (defTpl) {
+        if (defTpl && create) {
           setCompiler(defTpl.compiler);
         }
       })
@@ -193,17 +216,47 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
     return () => {
       active = false;
     };
-  }, [create, templates]);
+  }, [needsTemplates, templates, create]);
 
   const selectTemplate = (tpl: Template) => {
     setTemplateId(tpl.id);
     setCompiler(tpl.compiler);
   };
 
+  const runScan = async (): Promise<ScanProjectResult | null> => {
+    setScanning(true);
+    setError(null);
+    try {
+      const res = await scanProject({
+        remote_url: remoteUrl.trim(),
+        branch: branch.trim() || undefined,
+        username: username.trim() || undefined,
+        token: token || undefined,
+      });
+      setScanResult(res);
+      setScannedKey(currentScanKey);
+      if (!res.has_tex_files) {
+        setAddTemplate(true);
+      }
+      return res;
+    } catch (err: unknown) {
+      setError(errorText(err, "Repository konnte nicht geprüft werden."));
+      return null;
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const submit = async (e: Event) => {
     e.preventDefault();
-    setBusy(true);
     setError(null);
+    if (!create && !activeScan) {
+      const res = await runScan();
+      if (!res || !res.has_tex_files) {
+        return;
+      }
+    }
+    setBusy(true);
     const body: CreateProjectRequest = { name: name.trim(), compiler };
     if (create && account) {
       body.create_remote = {
@@ -218,6 +271,9 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
       body.branch = branch.trim() || undefined;
       body.username = username.trim() || undefined;
       body.token = token || undefined;
+      if (activeScan && !activeScan.has_tex_files && (activeScan.is_empty || addTemplate)) {
+        body.template_id = templateId || undefined;
+      }
     }
     try {
       const project = await createProject(body);
@@ -230,12 +286,66 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
 
   const input = (value: string, set: (v: string) => void) => ({
     value,
-    disabled: busy,
+    disabled: busy || scanning,
     onInput: (e: Event) => set((e.target as HTMLInputElement).value),
   });
 
+  const renderTemplatePicker = () => (
+    <div class="field">
+      <div class="template-picker-head">
+        <span>Template</span>
+        <a href="/templates" class="template-picker-link" onClick={linkClick}>
+          Alle Templates verwalten →
+        </a>
+      </div>
+      {templates === null && !templatesError && <div class="muted-text">Lade Templates…</div>}
+      {templatesError && (
+        <div class="alert alert-warn" role="alert">
+          <AlertIcon size={15} />
+          <span>{templatesError}</span>
+        </div>
+      )}
+      {templates && templates.length > 0 && (
+        <div class="template-picker-grid" role="radiogroup" aria-label="Template auswählen">
+          {templates.map((tpl) => {
+            const selected = tpl.id === templateId;
+            return (
+              <button
+                key={tpl.id}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                disabled={busy || scanning}
+                class={`template-pick-card${selected ? " is-selected" : ""}`}
+                onClick={() => selectTemplate(tpl)}
+              >
+                <TemplatePreviewThumbnail template={tpl} class="template-thumb-sm" />
+                <div class="template-pick-info">
+                  <div class="template-pick-head">
+                    <span class="template-pick-name">{tpl.name}</span>
+                    {!tpl.builtin && !tpl.public && <span class="badge badge-detached">Privat</span>}
+                  </div>
+                  {tpl.description && <span class="template-pick-desc">{tpl.description}</span>}
+                  <div class="template-pick-badges">
+                    <span class="badge badge-muted">{compilerBadgeLabel(tpl.compiler)}</span>
+                    <span class="badge badge-branch">{tpl.main_file}</span>
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <Modal title="Neues Projekt" onClose={onClose} busy={busy} class={create ? "modal-wide" : undefined}>
+    <Modal
+      title="Neues Projekt"
+      onClose={onClose}
+      busy={busy || scanning}
+      class={create || showConnectTemplatePicker ? "modal-wide" : undefined}
+    >
       <form class="form-stack" onSubmit={(e) => void submit(e)}>
         <div class="git-tabs" role="tablist">
           {(
@@ -325,60 +435,7 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
                 </label>
               )}
             </div>
-            <div class="field">
-              <div class="template-picker-head">
-                <span>Template</span>
-                <a href="/templates" class="template-picker-link" onClick={linkClick}>
-                  Alle Templates verwalten →
-                </a>
-              </div>
-              {templates === null && !templatesError && (
-                <div class="muted-text">Lade Templates…</div>
-              )}
-              {templatesError && (
-                <div class="alert alert-warn" role="alert">
-                  <AlertIcon size={15} />
-                  <span>{templatesError}</span>
-                </div>
-              )}
-              {templates && templates.length > 0 && (
-                <div class="template-picker-grid" role="radiogroup" aria-label="Template auswählen">
-                  {templates.map((tpl) => {
-                    const selected = tpl.id === templateId;
-                    return (
-                      <button
-                        key={tpl.id}
-                        type="button"
-                        role="radio"
-                        aria-checked={selected}
-                        disabled={busy}
-                        class={`template-pick-card${selected ? " is-selected" : ""}`}
-                        onClick={() => selectTemplate(tpl)}
-                      >
-                        <TemplatePreviewThumbnail template={tpl} class="template-thumb-sm" />
-                        <div class="template-pick-info">
-                          <div class="template-pick-head">
-                            <span class="template-pick-name">{tpl.name}</span>
-                            {!tpl.builtin && !tpl.public && (
-                              <span class="badge badge-detached">Privat</span>
-                            )}
-                          </div>
-                          {tpl.description && (
-                            <span class="template-pick-desc">{tpl.description}</span>
-                          )}
-                          <div class="template-pick-badges">
-                            <span class="badge badge-muted">
-                              {compilerBadgeLabel(tpl.compiler)}
-                            </span>
-                            <span class="badge badge-branch">{tpl.main_file}</span>
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+            {renderTemplatePicker()}
             <label class="check-field">
               <input
                 type="checkbox"
@@ -436,14 +493,71 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
           <span class="field-hint">Später in den Projekt-Einstellungen änderbar.</span>
         </label>
         {!create && (
-          <label class="field">
-            <span>Access-Token (optional)</span>
-            <input type="password" class="text-input" autoComplete="off" {...input(token, setToken)} />
-            <span class="field-hint">
-              GitLab-/GitHub-Personal-Access-Token mit Lese-/Schreibrechten auf das Repository
-              (read/write repository). Für SSH-URLs nicht nötig.
-            </span>
-          </label>
+          <>
+            <label class="field">
+              <span>Access-Token (optional)</span>
+              <input type="password" class="text-input" autoComplete="off" {...input(token, setToken)} />
+              {matchedAccount ? (
+                <span class="field-hint repo-match-hint">
+                  Gespeichertes Konto erkannt (<strong>{accountLabel(matchedAccount)}</strong>) —
+                  Token wird automatisch genutzt, sofern hier kein neues eingegeben wird.
+                </span>
+              ) : (
+                <span class="field-hint">
+                  GitLab-/GitHub-Personal-Access-Token mit Lese-/Schreibrechten auf das Repository
+                  (read/write repository). Für SSH-URLs nicht nötig.
+                </span>
+              )}
+            </label>
+
+            {activeScan && (
+              <div class={`repo-scan-box ${activeScan.has_tex_files ? "is-ok" : "is-warn"}`}>
+                <div class="repo-scan-summary">
+                  <strong>
+                    {activeScan.has_tex_files
+                      ? "LaTeX-Dateien gefunden"
+                      : "Keine .tex-Dateien im Repository gefunden"}
+                  </strong>
+                  <span class="muted-text">
+                    Branch <code>{activeScan.branch}</code> ·{" "}
+                    {activeScan.is_empty
+                      ? "leeres Repository"
+                      : `${activeScan.file_count} Datei(en)`}
+                    {activeScan.matched_account &&
+                      ` · Token via ${accountLabel({ ...activeScan.matched_account, ssh_host_key_fingerprint: null })}`}
+                  </span>
+                  {activeScan.has_tex_files && (
+                    <span class="muted-text">
+                      {activeScan.roots.length > 0
+                        ? `Hauptdatei: ${activeScan.roots.join(", ")}`
+                        : `Dateien: ${activeScan.tex_files.slice(0, 3).join(", ")}`}
+                      {activeScan.detected_compiler &&
+                        ` · erkannter Compiler: ${activeScan.detected_compiler}`}
+                    </span>
+                  )}
+                </div>
+
+                {!activeScan.has_tex_files && (
+                  <>
+                    <label class="check-field">
+                      <input
+                        type="checkbox"
+                        checked={activeScan.is_empty || addTemplate}
+                        disabled={busy || scanning || activeScan.is_empty}
+                        onChange={(e) => setAddTemplate((e.target as HTMLInputElement).checked)}
+                      />
+                      <span>
+                        {activeScan.is_empty
+                          ? "Mit gewähltem LaTeX-Template initialisieren (erforderlich, da Repo leer ist)"
+                          : "LaTeX-Template vorab ins Repository hinzufügen (bestehende Dateien bleiben erhalten)"}
+                      </span>
+                    </label>
+                    {showConnectTemplatePicker && renderTemplatePicker()}
+                  </>
+                )}
+              </div>
+            )}
+          </>
         )}
 
         {error && (
@@ -454,19 +568,33 @@ function NewProjectDialog({ onClose }: { onClose: () => void }) {
         )}
 
         <div class="form-actions">
-          {busy && (
+          {(busy || scanning) && (
             <span class="muted-text busy-hint">
               <span class="boot-spinner spinner-sm" />{" "}
-              {create ? "Repository wird angelegt…" : "Repository wird geklont – das kann etwas dauern…"}
+              {scanning
+                ? "Repository wird gescannt…"
+                : create
+                  ? "Repository wird angelegt…"
+                  : "Repository wird geklont – das kann etwas dauern…"}
             </span>
           )}
-          <button type="button" class="btn-ghost btn-sm" disabled={busy} onClick={onClose}>
+          <button type="button" class="btn-ghost btn-sm" disabled={busy || scanning} onClick={onClose}>
             Abbrechen
           </button>
+          {!create && (
+            <button
+              type="button"
+              class="btn-ghost btn-sm"
+              disabled={busy || scanning || !remoteUrl.trim()}
+              onClick={() => void runScan()}
+            >
+              {scanning ? "Prüfe…" : "Repository prüfen"}
+            </button>
+          )}
           <button
             type="submit"
             class="btn-primary btn-sm"
-            disabled={busy || !name.trim() || (create ? connecting || !account || !repo.trim() : !remoteUrl.trim())}
+            disabled={busy || scanning || !name.trim() || (create ? connecting || !account || !repo.trim() : !remoteUrl.trim())}
           >
             {busy ? (create ? "Lege an…" : "Klone…") : "Projekt anlegen"}
           </button>

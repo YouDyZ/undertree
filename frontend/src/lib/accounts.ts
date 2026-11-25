@@ -30,3 +30,36 @@ export function accountOptions(accounts: GitAccount[], githubAvailable: boolean)
   if (githubAvailable && !has("github")) opts.push({ value: NEW_GITHUB, label: "+ GitHub verbinden…" });
   return opts;
 }
+
+function parseHttpsUrl(raw: string): { auth: string; path: string } | null {
+  const trimmed = raw.trim();
+  if (!/^https:\/\//i.test(trimmed)) return null;
+  const rest = trimmed.slice(8).split(/[?#]/)[0] ?? "";
+  const slash = rest.indexOf("/");
+  const auth = slash === -1 ? rest : rest.slice(0, slash);
+  const path = slash === -1 ? "" : rest.slice(slash + 1);
+  if (!auth || auth.includes("@")) return null;
+  const normAuth = auth.toLowerCase().replace(/:443$/, "");
+  const normPath = path.replace(/^\/+|\/+$/g, "");
+  return { auth: normAuth, path: normPath };
+}
+
+/** Finds the most specific connected GitHub/GitLab account matching an `https://` repo URL. */
+export function matchAccountForUrl(
+  accounts: readonly GitAccount[],
+  remoteUrl: string
+): GitAccount | null {
+  const r = parseHttpsUrl(remoteUrl);
+  if (!r) return null;
+  const sorted = [...accounts]
+    .filter((a) => a.provider === "github" || a.provider === "gitlab")
+    .sort((a, b) => b.base_url.length - a.base_url.length || a.id - b.id);
+  for (const a of sorted) {
+    const b = parseHttpsUrl(a.base_url);
+    if (!b || b.auth !== r.auth) continue;
+    if (!b.path || r.path === b.path || r.path.startsWith(`${b.path}/`)) {
+      return a;
+    }
+  }
+  return null;
+}

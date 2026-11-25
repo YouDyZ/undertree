@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   ApiError,
+  type AutoPushResponse,
   type GitLogEntry,
   type GitStatus,
   type Repo,
@@ -13,6 +14,7 @@ import {
   gitPull,
   gitPush,
   gitSubmoduleUpdate,
+  triggerAutoPush,
 } from "../api";
 import {
   coAuthorsForCommit,
@@ -24,21 +26,26 @@ import {
   formatRelativeRepoPath,
   parseUnifiedDiff,
 } from "../lib/gitUi";
+import { formatAutoPushInterval, formatAutoPushTimestamp } from "../lib/gitReminder";
 import { AlertIcon, GitBranchIcon, RefreshIcon, SubmoduleIcon, XIcon } from "./Icons";
 
 export interface GitPanelProps {
   repos: Repo[];
   selectedRepo: string;
   readOnly?: boolean;
+  autoPushIntervalSecs?: number;
+  autoPushLastAt?: string | null;
+  autoPushLastError?: string | null;
   onSelectRepo: (repo: string) => void;
   lastEvent: ServerEvent | null;
   onClose: () => void;
   onNotify: (kind: "info" | "success" | "error", msg: string) => void;
   onTreeRefresh: () => void;
+  onAutoPushResult?: (res: AutoPushResponse) => void;
 }
 
 type GitTab = "changes" | "log";
-type BusyAction = "pull" | "push" | "submodule" | "commit" | null;
+type BusyAction = "pull" | "push" | "autopush" | "submodule" | "commit" | null;
 
 interface GitErrorBanner {
   title: string;
@@ -141,11 +148,15 @@ export function GitPanel({
   repos,
   selectedRepo,
   readOnly = false,
+  autoPushIntervalSecs = 0,
+  autoPushLastAt = null,
+  autoPushLastError = null,
   onSelectRepo,
   lastEvent,
   onClose,
   onNotify,
   onTreeRefresh,
+  onAutoPushResult,
 }: GitPanelProps) {
   const activeRepo = useMemo<Repo | undefined>(() => {
     return repos.find((r) => r.path === selectedRepo) ?? repos[0];
@@ -382,6 +393,26 @@ export function GitPanel({
       await loadRepoData(activeRepoPath, true);
     } catch (err: unknown) {
       setErrorBanner(formatApiError(err, "Push"));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleAutoPush = async () => {
+    if (busyAction) return;
+    setBusyAction("autopush");
+    setErrorBanner(null);
+    try {
+      const res = await triggerAutoPush();
+      onAutoPushResult?.(res);
+      onNotify(
+        "success",
+        res.pushed ? "Auto-Push erfolgreich." : "Keine Änderungen zum Pushen."
+      );
+      onTreeRefresh();
+      await loadRepoData(activeRepoPath, isInitialized);
+    } catch (err: unknown) {
+      setErrorBanner(formatApiError(err, "Auto-Push"));
     } finally {
       setBusyAction(null);
     }
@@ -656,6 +687,16 @@ export function GitPanel({
                 </button>
                 <button
                   type="button"
+                  class="btn-ghost btn-xs"
+                  disabled={busyAction !== null}
+                  onClick={() => void handleAutoPush()}
+                  title="Konfliktfrei committen &amp; pushen"
+                >
+                  <ArrowUpIcon />
+                  <span>{busyAction === "autopush" ? "Auto-Push…" : "Auto-Push jetzt"}</span>
+                </button>
+                <button
+                  type="button"
                   class="btn-ghost btn-xs git-action-sub"
                   disabled={busyAction !== null}
                   onClick={() => void handleSubmoduleUpdate(submoduleTarget)}
@@ -675,6 +716,22 @@ export function GitPanel({
                   </span>
                 </button>
               </section>
+            )}
+
+            {(autoPushIntervalSecs > 0 || autoPushLastAt || autoPushLastError) && (
+              <div class="git-autopush-bar">
+                <div class="git-autopush-meta">
+                  <span>Auto-Push: {formatAutoPushInterval(autoPushIntervalSecs)}</span>
+                  <span class="muted-text">
+                    Letzter Push: {formatAutoPushTimestamp(autoPushLastAt)}
+                  </span>
+                </div>
+                {autoPushLastError && (
+                  <div class="alert alert-error git-autopush-err" role="alert">
+                    {autoPushLastError}
+                  </div>
+                )}
+              </div>
             )}
 
             {/* Tabs: Änderungen (N) | Verlauf */}

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { GitAccount } from "../api";
-import { NEW_GITHUB, NEW_GITLAB, accountLabel, accountOptions, repoNameFromTitle } from "./accounts";
+import {
+  NEW_GITHUB,
+  NEW_GITLAB,
+  accountLabel,
+  accountOptions,
+  matchAccountForUrl,
+  repoNameFromTitle,
+} from "./accounts";
 
 describe("repoNameFromTitle", () => {
   it("makes a valid repo name", () => {
@@ -47,5 +54,30 @@ describe("accountOptions", () => {
     const o = accountOptions([acc(2, "gitlab")], false);
     expect(o.map((x) => x.value)).toEqual(["2", NEW_GITLAB]);
     expect(o[1]?.label).toBe("+ Weiteres GitLab verbinden…");
+  });
+});
+
+describe("matchAccountForUrl", () => {
+  const acc = (id: number, provider: GitAccount["provider"], base_url: string): GitAccount => ({
+    id,
+    provider,
+    base_url,
+    login: "al",
+    ssh_host_key_fingerprint: null,
+  });
+
+  it("matches exact host and subpath boundaries and rejects spoofed hosts/SSH", () => {
+    const accounts = [
+      acc(1, "gitlab", "https://gitlab.com"),
+      acc(2, "gitlab", "https://git.uni.de/gitlab"),
+      acc(3, "github", "https://github.com"),
+      acc(4, "zotero", "https://api.zotero.org"),
+    ];
+    expect(matchAccountForUrl(accounts, "https://GitLab.com:443/me/paper.git")?.id).toBe(1);
+    expect(matchAccountForUrl(accounts, "https://git.uni.de/gitlab/chair/paper.git")?.id).toBe(2);
+    expect(matchAccountForUrl(accounts, "https://git.uni.de/gitlab2/chair/paper.git")).toBeNull();
+    expect(matchAccountForUrl(accounts, "https://github.com/alice/paper")?.id).toBe(3);
+    expect(matchAccountForUrl(accounts, "https://gitlab.com.evil.org/me/paper")).toBeNull();
+    expect(matchAccountForUrl(accounts, "git@gitlab.com:me/paper.git")).toBeNull();
   });
 });

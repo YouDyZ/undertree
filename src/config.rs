@@ -70,6 +70,10 @@ pub struct Config {
     /// Seconds between checks of the Zotero-linked .bib files for changes; 0 = off
     #[arg(long, env = "UNDERTREE_ZOTERO_SYNC_SECS", default_value_t = 300)]
     pub zotero_sync_secs: u64,
+
+    /// Seconds between checks of projects with auto-push enabled; 0 = off
+    #[arg(long, env = "UNDERTREE_AUTO_PUSH_POLL_SECS", default_value_t = 15)]
+    pub auto_push_poll_secs: u64,
 }
 
 impl Config {

@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   ApiError,
+  type AutoPushResponse,
   type CommentThread,
   type CompileResult,
+  type GitStatus,
   type PresenceUser,
   type Project,
   type Repo,
@@ -15,12 +17,14 @@ import {
   errorText,
   fileApiUrl,
   getFileText,
+  getGitStatus,
   getTree,
   listComments,
   listProjectRoots,
   listZoteroLinks,
   logout,
   putFile,
+  triggerAutoPush,
   triggerCompile,
   updateProject,
 } from "../api";
@@ -59,6 +63,12 @@ import {
   mergeFileThreadsIntoProject,
   shouldApplyCommentsLoad,
 } from "../lib/comments";
+import {
+  DEFAULT_REMINDER_AFTER_MS,
+  hasPendingGitWork,
+  reminderSummary,
+  shouldRemindCommit,
+} from "../lib/gitReminder";
 import { shouldApplyProjectScopedResult } from "../lib/zotero";
 import {
   applyTourAction,
@@ -81,6 +91,7 @@ import { FileTree, type NotifyOptions } from "./FileTree";
 import { GitPanel } from "./GitPanel";
 import { GuidedTour } from "./GuidedTour";
 import {
+  AlertIcon,
   GitBranchIcon,
   HelpCircleIcon,
   LogOutIcon,
@@ -204,6 +215,14 @@ export function AppShell({
 
   const [gitDrawerOpen, setGitDrawerOpen] = useState(false);
   const [selectedGitRepo, setSelectedGitRepo] = useState<string>("");
+  const [rootGitStatus, setRootGitStatus] = useState<GitStatus | null>(null);
+  const [dirtySinceMs, setDirtySinceMs] = useState<number | null>(null);
+  const [snoozedUntilMs, setSnoozedUntilMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [dismissedAutoPushErr, setDismissedAutoPushErr] = useState<string | null>(null);
+  const [autoPushBusy, setAutoPushBusy] = useState(false);
+  const gitStatusGenRef = useRef(0);
+  const gitRefreshTimerRef = useRef<number | null>(null);
 
   const [tourCompleted, setTourCompleted] = useState(() => hasCompletedTour());
   const [tourOpen, setTourOpen] = useState(() => shouldStartTourFromUrl(window.location.search));
@@ -271,6 +290,10 @@ export function AppShell({
         window.clearTimeout(rootsRefreshTimerRef.current);
         rootsRefreshTimerRef.current = null;
       }
+      if (gitRefreshTimerRef.current !== null) {
+        window.clearTimeout(gitRefreshTimerRef.current);
+        gitRefreshTimerRef.current = null;
+      }
       for (const session of map.values()) {
         session.destroy();
       }
@@ -312,6 +335,8 @@ export function AppShell({
   const onRefreshProjectRef = useRef(onRefreshProject);
   onRefreshProjectRef.current = onRefreshProject;
 
+  const scheduleGitStatusRef = useRef<() => void>(() => {});
+
   const ensureDocSession = useCallback(
     (path: string, repo: string): DocSession => {
       const existing = sessionsRef.current.get(path);
@@ -325,13 +350,12 @@ export function AppShell({
           void onRefreshProjectRef.current?.();
         },
       });
-      if (isTexFile(path)) {
-        session.ydoc.on("update", () => {
-          if (session.provider.synced) {
-            scheduleRootsRefresh();
-          }
-        });
-      }
+      session.ydoc.on("update", () => {
+        if (session.provider.synced) {
+          if (isTexFile(path)) scheduleRootsRefresh();
+          scheduleGitStatusRef.current();
+        }
+      });
       sessionsRef.current.set(path, session);
       return session;
     },
@@ -496,6 +520,53 @@ export function AppShell({
   const readOnly = isReadOnlyRole(project.my_role);
   const canComment = canCommentInProject(project.my_role);
   const roleTooltip = MEMBER_ROLE_DESCRIPTIONS[project.my_role];
+
+  const loadRootGitStatus = useCallback(async () => {
+    if (readOnly) {
+      setRootGitStatus(null);
+      setDirtySinceMs(null);
+      return;
+    }
+    const targetPid = project.id;
+    const gen = ++gitStatusGenRef.current;
+    try {
+      const next = await getGitStatus("");
+      if (gen !== gitStatusGenRef.current || projectIdRef.current !== targetPid) return;
+      setRootGitStatus(next);
+      setDirtySinceMs((prev) => (hasPendingGitWork(next) ? (prev ?? Date.now()) : null));
+    } catch {
+      // ignore transient background status errors
+    }
+  }, [project.id, readOnly]);
+
+  const scheduleGitStatusRefresh = useCallback(() => {
+    if (readOnly) return;
+    if (gitRefreshTimerRef.current !== null) {
+      window.clearTimeout(gitRefreshTimerRef.current);
+    }
+    gitRefreshTimerRef.current = window.setTimeout(() => {
+      gitRefreshTimerRef.current = null;
+      void loadRootGitStatus();
+    }, 1500);
+  }, [loadRootGitStatus, readOnly]);
+  scheduleGitStatusRef.current = scheduleGitStatusRefresh;
+
+  useEffect(() => {
+    setDirtySinceMs(null);
+    setSnoozedUntilMs(null);
+    setDismissedAutoPushErr(null);
+    void loadRootGitStatus();
+  }, [project.id, loadRootGitStatus]);
+
+  useEffect(() => {
+    if (readOnly) return;
+    const tickId = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    const pollId = window.setInterval(() => void loadRootGitStatus(), 60_000);
+    return () => {
+      window.clearInterval(tickId);
+      window.clearInterval(pollId);
+    };
+  }, [loadRootGitStatus, readOnly]);
 
   useEffect(() => {
     if (!canComment) {
@@ -716,9 +787,15 @@ export function AppShell({
         void loadRoots();
         void loadZoteroLinks();
         void loadAllComments();
+        void loadRootGitStatus();
+        break;
+      case "git_changed":
+        void loadRootGitStatus();
+        void onRefreshProjectRef.current?.();
         break;
       case "doc_reloaded":
         pushToast("info", `Extern aktualisiert: ${lastEvent.path}`);
+        void loadRootGitStatus();
         if (isBibtexFile(lastEvent.path)) {
           void getFileText(lastEvent.path)
             .then((text) => {
@@ -786,6 +863,7 @@ export function AppShell({
     loadZoteroLinks,
     loadAllComments,
     loadFileComments,
+    loadRootGitStatus,
     pushToast,
     closeTab,
   ]);
@@ -1008,6 +1086,51 @@ export function AppShell({
     setTourOpen(next.open);
   }, [tourCompleted]);
 
+  const applyAutoPushResult = useCallback(
+    (res: AutoPushResponse) => {
+      const cur = projectRef.current;
+      cur.onProjectChanged({
+        ...cur.project,
+        auto_push_last_at: res.auto_push_last_at,
+        auto_push_last_error: res.auto_push_last_error,
+      });
+      setDismissedAutoPushErr(null);
+      if (res.pushed) {
+        setDirtySinceMs(null);
+      }
+      void loadRootGitStatus();
+    },
+    [loadRootGitStatus]
+  );
+
+  const handleBannerAutoPush = useCallback(async () => {
+    if (autoPushBusy || readOnly) return;
+    setAutoPushBusy(true);
+    try {
+      const res = await triggerAutoPush(project.id);
+      applyAutoPushResult(res);
+      pushToast(
+        "success",
+        res.pushed ? "Auto-Push erfolgreich." : "Keine Änderungen zum Pushen."
+      );
+    } catch (err: unknown) {
+      pushToast("error", errorText(err, "Auto-Push fehlgeschlagen."));
+      void onRefreshProjectRef.current?.();
+      void loadRootGitStatus();
+    } finally {
+      setAutoPushBusy(false);
+    }
+  }, [autoPushBusy, readOnly, project.id, applyAutoPushResult, pushToast, loadRootGitStatus]);
+
+  const hasAutoPushError = Boolean(project.auto_push_last_error);
+  const showAutoPushErrorBanner =
+    !readOnly && hasAutoPushError && dismissedAutoPushErr !== project.auto_push_last_error;
+  const showCommitReminderBanner =
+    !readOnly &&
+    !showAutoPushErrorBanner &&
+    shouldRemindCommit(dirtySinceMs, nowMs, snoozedUntilMs, project.auto_push_interval_secs);
+  const pendingGit = !readOnly && (hasAutoPushError || hasPendingGitWork(rootGitStatus));
+
   return (
     <div class="app-shell">
       <header class="topbar">
@@ -1121,6 +1244,12 @@ export function AppShell({
           >
             <GitBranchIcon size={14} />
             <span>Git</span>
+            {pendingGit && (
+              <span
+                class={`git-status-dot${hasAutoPushError ? " is-error" : ""}`}
+                aria-hidden="true"
+              />
+            )}
           </button>
 
           <button
@@ -1164,6 +1293,55 @@ export function AppShell({
           </button>
         </div>
       </header>
+
+      {(showAutoPushErrorBanner || showCommitReminderBanner) && (
+        <div
+          class={`git-reminder-banner${showAutoPushErrorBanner ? " is-error" : ""}`}
+          role={showAutoPushErrorBanner ? "alert" : "status"}
+        >
+          <span class="git-reminder-text">
+            <AlertIcon size={15} />
+            <span>
+              {showAutoPushErrorBanner
+                ? `Auto-Push-Fehler: ${project.auto_push_last_error}`
+                : `${reminderSummary(rootGitStatus) || "Ungespeicherte Git-Änderungen"} — noch nicht gepusht.`}
+            </span>
+          </span>
+          <div class="git-reminder-actions">
+            <button
+              type="button"
+              class="btn-primary btn-xs"
+              disabled={autoPushBusy}
+              onClick={() => void handleBannerAutoPush()}
+            >
+              {autoPushBusy ? "Pushe…" : "Auto-Push jetzt"}
+            </button>
+            <button
+              type="button"
+              class="btn-ghost btn-xs"
+              onClick={() => {
+                setSelectedGitRepo("");
+                setGitDrawerOpen(true);
+              }}
+            >
+              Git öffnen
+            </button>
+            <button
+              type="button"
+              class="btn-ghost btn-xs"
+              onClick={() => {
+                if (showAutoPushErrorBanner) {
+                  setDismissedAutoPushErr(project.auto_push_last_error);
+                } else {
+                  setSnoozedUntilMs(Date.now() + DEFAULT_REMINDER_AFTER_MS);
+                }
+              }}
+            >
+              {showAutoPushErrorBanner ? "Ausblenden" : "Später (15 Min)"}
+            </button>
+          </div>
+        </div>
+      )}
 
       <div class="workspace-body">
         <div class="pane-sidebar" data-tour="file-tree" style={{ width: `${sidebarWidth}px` }}>
@@ -1332,11 +1510,18 @@ export function AppShell({
             repos={tree?.repos ?? []}
             selectedRepo={selectedGitRepo}
             readOnly={readOnly}
+            autoPushIntervalSecs={project.auto_push_interval_secs}
+            autoPushLastAt={project.auto_push_last_at}
+            autoPushLastError={project.auto_push_last_error}
             onSelectRepo={setSelectedGitRepo}
             lastEvent={lastEvent}
             onClose={() => setGitDrawerOpen(false)}
             onNotify={pushToast}
-            onTreeRefresh={() => void refreshWorkspace()}
+            onTreeRefresh={() => {
+              void refreshWorkspace();
+              void loadRootGitStatus();
+            }}
+            onAutoPushResult={applyAutoPushResult}
           />
         )}
       </div>

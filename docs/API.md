@@ -233,7 +233,7 @@ every route; the doc socket is read-only below `editor` (see Documents).
 |---|---|
 | `viewer` | `GET …`, `GET …/members`, `GET …/tree`, `GET …/files/{*path}`, `GET …/roots`, `POST …/compile` (compiling changes no sources), `GET …/compile`, `GET …/compile/log`, `GET …/pdf/{*root}`, `GET …/synctex/forward`, `GET …/synctex/inverse`, `GET …/git/status`, `GET …/git/diff`, `GET …/git/log`, `GET …/git/coauthors`, `GET …/zotero/links`, `GET …/comments`, `GET …/chat`, `POST …/spellcheck`, `GET …/dictionary`, `WS /ws/projects/{pid}/events` (presence), `WS /ws/projects/{pid}/doc/{*path}` (read-only below `editor`), `DELETE …/members/{me}` (leave) |
 | `commenter` | `POST …/comments`, `POST …/comments/{id}/messages`, `PATCH …/comments/{id}` (resolve); `PATCH`/`DELETE …/comments/{id}/messages/{mid}` (author only); `DELETE …/comments/{id}` (thread creator or owner), `POST …/chat`, `PATCH`/`DELETE …/chat/{id}` (author only) |
-| `editor` | `PUT`/`DELETE …/files/{*path}`, doc socket updates, `POST …/git/commit`, `PATCH …/git/identity`, `POST …/git/pull`, `POST …/git/push`, `POST …/git/submodule-update`, `POST …/zotero/import`, `POST …/zotero/refresh`, `PATCH …/zotero/links`, `DELETE …/zotero/links`, `POST …/dictionary`, `DELETE …/dictionary/{word}`, `PUT …/spellcheck/rules` |
+| `editor` | `PUT`/`DELETE …/files/{*path}`, doc socket updates, `POST …/git/commit`, `POST …/git/auto-push`, `PATCH …/git/identity`, `POST …/git/pull`, `POST …/git/push`, `POST …/git/submodule-update`, `POST …/zotero/import`, `POST …/zotero/refresh`, `PATCH …/zotero/links`, `DELETE …/zotero/links`, `POST …/dictionary`, `DELETE …/dictionary/{word}`, `PUT …/spellcheck/rules` |
 | `owner` | `PATCH …`, `DELETE …`, `POST …/members`, `PATCH …/members/{username}`, `DELETE …/members/{username}`, `POST …/members/{username}/invite-remote` |
 
 A project always keeps at least one owner. The creator becomes `owner`; members that existed
@@ -256,6 +256,10 @@ type Project = {
   account_id: number | null;     // account the remote repo was created with (create_remote), else null
   commit_name: string | null;    // caller's per-project commit author name override (null = user display_name)
   commit_email: string | null;   // caller's per-project commit author e-mail override (null = profile default)
+  auto_push_interval_secs: number;       // 0 = off, else 60..=86400
+  auto_push_message: string;             // commit message template (placeholders: {files}, {count}, {time})
+  auto_push_last_at: string | null;      // RFC 3339 timestamp of the last successful auto-push
+  auto_push_last_error: string | null;   // error/conflict message of the last failed auto-push, else null
   created_at: string;            // RFC 3339
 }
 ```
@@ -263,11 +267,19 @@ type Project = {
 ### `GET /api/projects`
 `200` → `Project[]` — projects the caller is a member of (admins: all), newest first.
 
+### `POST /api/projects/scan`
+`{ "remote_url": "https://gitlab.com/me/paper.git", "branch"?: "main", "username"?: "oauth2", "token"?: "glpat-…" }`
+- Clones the repository temporarily (with the same credential resolution as `POST /api/projects`, including automatic reuse of a matching connected GitHub/GitLab account token if `token` is omitted) and scans for `.tex` files and LaTeX roots.
+- `200` → `{ branch: string, is_empty: bool, file_count: number, has_tex_files: bool, tex_files: string[], roots: string[], detected_compiler: "pdflatex" | "xelatex" | "lualatex" | null, matched_account: { id, provider, base_url, login } | null }`.
+  Clone/auth failure → `502 git_failed` (message scrubbed of tokens).
+
 ### `POST /api/projects`
-`{ "name": "ICML 2027", "remote_url": "https://gitlab.com/me/paper.git", "branch": "main", "username": "oauth2", "token": "glpat-…" }`
-- `branch`, `username`, `token`, `compiler` optional (`compiler` omitted → `"auto"`).
+`{ "name": "ICML 2027", "remote_url": "https://gitlab.com/me/paper.git", "branch": "main", "username": "oauth2", "token": "glpat-…", "template_id": "builtin:article" }`
+- `branch`, `username`, `token`, `template_id`, `compiler` optional (`compiler` omitted → `"auto"`).
   `branch` omitted → remote default branch.
-  `username` defaults to `oauth2` (works for GitLab and GitHub PATs).
+  `username` defaults to `oauth2` (or `x-access-token` for matched GitHub accounts).
+- If `token` is omitted on an `https://` URL, undertree automatically reuses a matching connected GitHub/GitLab account token from `user_accounts` (with an anonymous retry if the repo is public and the stored token fails).
+- `template_id` (existing repo path): optional template id from `GET /api/templates`. Only allowed when the repository contains no `.tex` files yet (else `400 invalid_request`). Copies template files without overwriting existing files, commits, and pushes. Empty repositories without `template_id` → `400 invalid_request`.
 - `remote_url`: `https://…` (token used via HTTP basic auth) or `git@host:path` / `ssh://…`
   (server SSH key, token ignored). URLs with embedded credentials → `400 invalid_request`.
 - Clones (with submodules) synchronously. `201` → `Project`.
@@ -311,7 +323,8 @@ type Project = {
 ### `GET /api/projects/{pid}` → `Project`
 
 ### `PATCH /api/projects/{pid}` *(owner)*
-`{ "name"?: string, "username"?: string, "token"?: string | null, "compiler"?: "auto" | "pdflatex" | "xelatex" | "lualatex", "main_files"?: string[] }` → `200 Project`.
+`{ "name"?: string, "username"?: string, "token"?: string | null, "compiler"?: "auto" | "pdflatex" | "xelatex" | "lualatex", "main_files"?: string[], "auto_push_interval_secs"?: number, "auto_push_message"?: string }` → `200 Project`.
+`auto_push_interval_secs`: `0` (off, clears `auto_push_last_error`) or `60..=86400`. `auto_push_message`: 1–200 chars, no control chars (`""` resets to `"Auto-save: {files}"`).
 Projects created before `"auto"` existed keep their fixed engine until changed here.
 `main_files` replaces the list (order kept, duplicates dropped, `[]` = automatic): at most 20
 entries, each an existing `.tex` file in the workspace inside an initialized repo (`400`/`404` as in
@@ -1013,6 +1026,15 @@ these (`[]` = none; the author is skipped). Each must be the project owner, a me
 else `400 invalid_request`.
 `200` → `{ "sha": "...", "short": "abc1234" }`. `409 conflict` if nothing to commit.
 
+### `POST /api/projects/{pid}/git/auto-push` *(editor)*
+Runs the conflict-free auto-commit & push pass immediately across initialized submodules and the
+parent repo using the project's `auto_push_message` template (most recent contributor as author,
+other concurrent editors as `Co-authored-by`). Before committing, fetches upstream; non-overlapping
+or cleanly 3-way-mergeable remote text changes (`diffy::merge` preflight in memory) are merged
+into open docs before pushing. Line/binary/diverged conflicts abort cleanly with `409 conflict`
+without leaving conflict markers on disk and record `auto_push_last_error`.
+`200` → `{ "pushed": boolean, "sha": string | null, "auto_push_last_at": string | null, "auto_push_last_error": string | null }`.
+
 ### `GET /api/projects/{pid}/git/coauthors?repo=papers/icml&paths=papers/icml/intro.tex`
 `200` → `{ username: string; display_name: string }[]` — co-authors detected for the next commit
 with the same `repo`/`paths` (`paths` optional, repeatable), excluding the caller.
@@ -1043,6 +1065,7 @@ Body `{ "path": "papers/icml", "remote": true }` — `path` optional (all submod
 | `UNDERTREE_LANGUAGETOOL_URL` | – | LanguageTool server (`http://languagetool:8010` with the compose service); unset = spell check off |
 | `UNDERTREE_GITHUB_API_URL` | `https://api.github.com` | GitHub REST API base; only for tests (mock server) |
 | `UNDERTREE_ZOTERO_SYNC_SECS` | `300` | seconds between the background checks of Zotero-linked `.bib` files; `0` = off |
+| `UNDERTREE_AUTO_PUSH_POLL_SECS` | `15` | seconds between background checks for projects with `auto_push_interval_secs > 0`; `0` = off |
 | `UNDERTREE_ZOTERO_API_URL` | `https://api.zotero.org` | Zotero Web API base; only for tests (mock server) |
 
 ## Admin CLI

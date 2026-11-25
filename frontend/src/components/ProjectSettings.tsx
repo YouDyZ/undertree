@@ -32,6 +32,11 @@ import {
   formatRoleError,
 } from "../lib/roles";
 import { formatAutoCompilerStatus, mainFileOptions, toggleMainFile } from "../lib/roots";
+import {
+  AUTO_PUSH_PRESETS,
+  DEFAULT_AUTO_PUSH_MESSAGE,
+  formatAutoPushTimestamp,
+} from "../lib/gitReminder";
 import { navigate } from "../lib/route";
 import { TrashIcon } from "./Icons";
 import { ConfirmModal, Modal } from "./Modal";
@@ -62,6 +67,10 @@ export function ProjectSettings({
   const [name, setName] = useState(project.name);
   const [commitName, setCommitName] = useState(project.commit_name ?? "");
   const [commitEmail, setCommitEmail] = useState(project.commit_email ?? "");
+  const [autoPushSecs, setAutoPushSecs] = useState(project.auto_push_interval_secs);
+  const [autoPushMessage, setAutoPushMessage] = useState(
+    project.auto_push_message || DEFAULT_AUTO_PUSH_MESSAGE
+  );
   const [gitUser, setGitUser] = useState("");
   const [token, setToken] = useState("");
   const [members, setMembers] = useState<ProjectMember[] | null>(null);
@@ -77,6 +86,11 @@ export function ProjectSettings({
     setCommitName(project.commit_name ?? "");
     setCommitEmail(project.commit_email ?? "");
   }, [project.id, project.commit_name, project.commit_email]);
+
+  useEffect(() => {
+    setAutoPushSecs(project.auto_push_interval_secs);
+    setAutoPushMessage(project.auto_push_message || DEFAULT_AUTO_PUSH_MESSAGE);
+  }, [project.id, project.auto_push_interval_secs, project.auto_push_message]);
 
   useEffect(() => {
     listMembers(project.id)
@@ -173,6 +187,22 @@ export function ProjectSettings({
       },
       "Git-Autor für dieses Projekt gespeichert.",
       "Speichern fehlgeschlagen."
+    );
+  };
+
+  const trimmedAutoPushMsg = autoPushMessage.trim() || DEFAULT_AUTO_PUSH_MESSAGE;
+  const autoPushDirty =
+    autoPushSecs !== project.auto_push_interval_secs ||
+    trimmedAutoPushMsg !== (project.auto_push_message || DEFAULT_AUTO_PUSH_MESSAGE);
+
+  const saveAutoPush = (e: Event) => {
+    e.preventDefault();
+    void patch(
+      {
+        auto_push_interval_secs: autoPushSecs,
+        auto_push_message: trimmedAutoPushMsg,
+      },
+      "Auto-Push-Einstellungen gespeichert."
     );
   };
 
@@ -363,6 +393,58 @@ export function ProjectSettings({
               )}
               <button type="submit" class="btn-primary btn-sm" disabled={busy || !token}>
                 {project.has_token ? "Token ersetzen" : "Token speichern"}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {canManage && (
+          <form class="settings-section form-stack" onSubmit={saveAutoPush}>
+            <h3>Auto-Push</h3>
+            <div class="field-row">
+              <label class="field">
+                <span>Intervall</span>
+                <select
+                  class="text-input"
+                  value={String(autoPushSecs)}
+                  disabled={busy}
+                  onChange={(e) => setAutoPushSecs(Number((e.target as HTMLSelectElement).value))}
+                >
+                  {AUTO_PUSH_PRESETS.map((p) => (
+                    <option key={p.secs} value={String(p.secs)}>
+                      {p.label}
+                    </option>
+                  ))}
+                  {!AUTO_PUSH_PRESETS.some((p) => p.secs === autoPushSecs) && (
+                    <option value={String(autoPushSecs)}>Alle {autoPushSecs} Sekunden</option>
+                  )}
+                </select>
+              </label>
+              <label class="field">
+                <span>Auto-Commit-Nachricht</span>
+                <input
+                  type="text"
+                  class="text-input"
+                  maxLength={200}
+                  placeholder={DEFAULT_AUTO_PUSH_MESSAGE}
+                  {...field(autoPushMessage, setAutoPushMessage)}
+                />
+              </label>
+            </div>
+            <span class="field-hint">
+              Platzhalter: <code>{"{files}"}</code>, <code>{"{count}"}</code>,{" "}
+              <code>{"{time}"}</code>. Gemeinsame Editor-Änderungen laufen über CRDT ohne
+              Merge-Konflikte zusammen (mit <code>Co-authored-by</code>). Letzter Auto-Push:{" "}
+              {formatAutoPushTimestamp(project.auto_push_last_at)}.
+            </span>
+            {project.auto_push_last_error && (
+              <div class="alert alert-error" role="alert">
+                Letzter Auto-Push-Fehler: {project.auto_push_last_error}
+              </div>
+            )}
+            <div class="form-actions">
+              <button type="submit" class="btn-primary btn-sm" disabled={busy || !autoPushDirty}>
+                Speichern
               </button>
             </div>
           </form>

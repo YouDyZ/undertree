@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path as FsPath, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -32,7 +32,7 @@ use notify_debouncer_full::{
     DebounceEventResult,
 };
 use similar::DiffTag;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Notify, RwLock, RwLockWriteGuard};
 use yrs::{
     encoding::read::Cursor,
     sync::{Awareness, DefaultProtocol, Message, MessageReader, Protocol, SyncMessage},
@@ -246,6 +246,37 @@ impl Room {
         }
     }
 
+    /// Atomically 3-way merges `theirs` against `base` directly onto the current live CRDT doc
+    /// and updates `disk` + workspace on success. Returns `Err(())` without modifying doc or disk
+    /// if live edits conflict with `theirs`.
+    pub fn merge_external(
+        &self,
+        base: &str,
+        theirs: &str,
+        workspace: &Workspace,
+        events: &Events,
+    ) -> Result<(), ()> {
+        let mut disk = self.disk.lock().unwrap();
+        let merged = {
+            let aw = self.awareness.lock().unwrap();
+            let mut txn = aw.doc().transact_mut();
+            let live = self.text.get_string(&txn);
+            let Ok(merged) = diffy::merge(base, &live, theirs) else {
+                return Err(());
+            };
+            apply_diff(&mut txn, &self.text, &live, &merged);
+            merged
+        };
+        if workspace.write(&self.path, merged.as_bytes()).is_err() {
+            return Err(());
+        }
+        *disk = merged;
+        let _ = events.send(Event::DocReloaded {
+            path: self.path.clone(),
+        });
+        Ok(())
+    }
+
     /// Merges an external change on disk into the doc. Returns whether anything changed.
     pub fn sync_from_disk(&self, workspace: &Workspace, events: &Events) -> bool {
         let bytes = match workspace.read(&self.path) {
@@ -348,6 +379,20 @@ impl Room {
 pub struct Docs {
     rooms: Mutex<HashMap<String, Arc<Room>>>,
     state_dir: PathBuf,
+    watcher_paused: AtomicUsize,
+    flush_gate: RwLock<()>,
+}
+
+/// RAII guard pausing file-watcher reloads and background `flush_loop` disk writes during git sync.
+pub struct SyncPauseGuard<'a> {
+    count: &'a AtomicUsize,
+    _gate: RwLockWriteGuard<'a, ()>,
+}
+
+impl Drop for SyncPauseGuard<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Docs {
@@ -356,7 +401,22 @@ impl Docs {
         Ok(Self {
             rooms: Mutex::default(),
             state_dir,
+            watcher_paused: AtomicUsize::new(0),
+            flush_gate: RwLock::new(()),
         })
+    }
+
+    pub async fn pause_sync(&self) -> SyncPauseGuard<'_> {
+        let gate = self.flush_gate.write().await;
+        self.watcher_paused.fetch_add(1, Ordering::SeqCst);
+        SyncPauseGuard {
+            count: &self.watcher_paused,
+            _gate: gate,
+        }
+    }
+
+    fn is_watcher_paused(&self) -> bool {
+        self.watcher_paused.load(Ordering::SeqCst) > 0
     }
 
     pub fn get(&self, path: &str) -> Option<Arc<Room>> {
@@ -479,7 +539,10 @@ async fn flush_loop(app: Arc<Project>, room: Arc<Room>) {
             .await
             .is_ok()
         {}
-        room.flush(&app.workspace, &app.events);
+        {
+            let _rd = app.docs.flush_gate.read().await;
+            room.flush(&app.workspace, &app.events);
+        }
         crate::comments::persist(&app, &room).await;
         if app.docs.try_unload(&room) {
             return;
@@ -653,6 +716,9 @@ pub fn spawn_watcher(app: Arc<Project>) -> notify_debouncer_full::notify::Result
                     };
                     tree_changed |= structural && !ours;
                     crate::compile::changed(&app, &rel);
+                    if app.docs.is_watcher_paused() {
+                        continue;
+                    }
                     let Some(room) = app.docs.get(&rel) else {
                         continue;
                     };
@@ -806,5 +872,19 @@ mod tests {
         assert_eq!(relative(root, FsPath::new("/w/p/.git")), None);
         assert_eq!(relative(root, FsPath::new("/w/.b.tex.undertree-tmp")), None);
         assert_eq!(relative(root, FsPath::new("/w")), None);
+    }
+
+    #[tokio::test]
+    async fn pause_sync_refcounts_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = Docs::new(dir.path().to_owned()).unwrap();
+        assert!(!docs.is_watcher_paused());
+        let g1 = docs.pause_sync().await;
+        assert!(docs.is_watcher_paused());
+        docs.watcher_paused.fetch_add(1, Ordering::SeqCst);
+        drop(g1);
+        assert!(docs.is_watcher_paused());
+        docs.watcher_paused.fetch_sub(1, Ordering::SeqCst);
+        assert!(!docs.is_watcher_paused());
     }
 }

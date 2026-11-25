@@ -10,9 +10,15 @@
 
 use std::{
     collections::HashSet,
-    io::{Cursor, Read},
-    path::{Path as FsPath, PathBuf},
+    ffi::OsStr,
+    io::{self, Cursor, ErrorKind, Read, Write},
+    path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
+};
+
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
 };
 
 use axum::{
@@ -293,17 +299,112 @@ fn may_manage(t: &Template, user: &User) -> Result<(), ApiError> {
 
 /// Writes the files of `t` into the directory `to`.
 pub async fn copy_files(app: &AppState, t: &Template, to: &FsPath) -> Result<(), ApiError> {
+    copy_files_with(app, t, to, true).await
+}
+
+/// Writes the files of `t` into `to` without overwriting any file that already exists, and
+/// refuses any symlinks or `.git` path components inside `to`.
+pub async fn copy_files_no_overwrite(
+    app: &AppState,
+    t: &Template,
+    to: &FsPath,
+) -> Result<(), ApiError> {
+    copy_files_with(app, t, to, false).await
+}
+
+/// Writes `data` at `root/rel` without following or replacing symlinks, creating missing parent
+/// directories inside `root`, and without overwriting an existing regular entry.
+pub(crate) fn write_confined_no_overwrite(
+    root: &FsPath,
+    rel: &FsPath,
+    data: &[u8],
+) -> io::Result<()> {
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(seg) if seg != OsStr::new(".git") => parts.push(seg),
+            _ => return Err(io::Error::new(ErrorKind::PermissionDenied, "unsafe path")),
+        }
+    }
+    let Some((file, parents)) = parts.split_last() else {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "empty path"));
+    };
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.is_symlink() => {
+            return Err(io::Error::new(ErrorKind::PermissionDenied, "symlink root"));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir_all(root)?,
+        Err(e) => return Err(e),
+    }
+    let mut cur = Dir::open_ambient_dir(root, ambient_authority())?;
+    for part in parents {
+        match cur.symlink_metadata(part) {
+            Ok(m) if m.is_symlink() => {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "symlink in path",
+                ))
+            }
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "parent is not a directory",
+                ))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => cur.create_dir(part)?,
+            Err(e) => return Err(e),
+        }
+        cur = cur.open_dir(part)?;
+    }
+    match cur.symlink_metadata(file) {
+        Ok(m) if m.is_symlink() => Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "symlink target",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let mut f = cur.open_with(file, OpenOptions::new().write(true).create_new(true))?;
+            f.write_all(data)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn map_confined_io(e: io::Error) -> ApiError {
+    if e.kind() == ErrorKind::PermissionDenied || e.kind() == ErrorKind::AlreadyExists {
+        ApiError::bad_request("repository contains unsafe symlinks or colliding paths")
+    } else {
+        ApiError::internal(e)
+    }
+}
+
+async fn copy_files_with(
+    app: &AppState,
+    t: &Template,
+    to: &FsPath,
+    overwrite: bool,
+) -> Result<(), ApiError> {
     if let Some(b) = BUILTINS.iter().find(|b| b.id == t.id) {
-        for (path, content) in b.files {
-            write(&to.join(path), content.as_bytes()).map_err(ApiError::internal)?;
+        let to_root = to.to_owned();
+        if overwrite {
+            for (path, content) in b.files {
+                write(&to_root.join(path), content.as_bytes()).map_err(ApiError::internal)?;
+            }
+        } else {
+            for (path, content) in b.files {
+                write_confined_no_overwrite(&to_root, FsPath::new(path), content.as_bytes())
+                    .map_err(map_confined_io)?;
+            }
         }
         return Ok(());
     }
     let (from, to) = (dir(app, &t.id), to.to_owned());
-    tokio::task::spawn_blocking(move || copy_tree(&from, &to))
+    tokio::task::spawn_blocking(move || copy_tree_with(&from, &to, overwrite))
         .await
         .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)
+        .map_err(map_confined_io)
 }
 
 fn write(path: &FsPath, data: &[u8]) -> std::io::Result<()> {
@@ -311,18 +412,33 @@ fn write(path: &FsPath, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
 }
 
-fn copy_tree(from: &FsPath, to: &FsPath) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        let (src, dst) = (e.path(), to.join(e.file_name()));
-        if e.file_type()?.is_dir() {
-            copy_tree(&src, &dst)?;
-        } else {
-            std::fs::copy(&src, &dst)?;
+fn copy_tree_with(from: &FsPath, to: &FsPath, overwrite: bool) -> std::io::Result<()> {
+    fn walk(
+        base_from: &FsPath,
+        cur_from: &FsPath,
+        to_root: &FsPath,
+        overwrite: bool,
+    ) -> io::Result<()> {
+        for e in std::fs::read_dir(cur_from)? {
+            let e = e?;
+            let src = e.path();
+            if e.file_type()?.is_dir() {
+                walk(base_from, &src, to_root, overwrite)?;
+            } else if overwrite {
+                let rel = src.strip_prefix(base_from).map_err(io::Error::other)?;
+                write(&to_root.join(rel), &std::fs::read(&src)?)?;
+            } else {
+                let rel = src.strip_prefix(base_from).map_err(io::Error::other)?;
+                let data = std::fs::read(&src)?;
+                write_confined_no_overwrite(to_root, rel, &data)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
+    if overwrite {
+        std::fs::create_dir_all(to)?;
+    }
+    walk(from, from, to, overwrite)
 }
 
 pub async fn list(

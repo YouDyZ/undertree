@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Output,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -29,13 +29,30 @@ use crate::{
     AppState,
 };
 
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Project git credentials (token from an encrypted DB column, see projects.rs).
 #[derive(Clone)]
 pub struct Creds {
     pub username: String,
     pub token: String,
+    /// Normalized `host[:port]` (`:443` stripped, lowercased) when `remote_url` is `https://`.
+    pub host: Option<String>,
+}
+
+/// Extracts normalized lowercase `host[:port]` (`:443` stripped) from an `https://` URL.
+pub(crate) fn https_host(url: &str) -> Option<String> {
+    let prefix = url.get(..8)?;
+    if !prefix.eq_ignore_ascii_case("https://") {
+        return None;
+    }
+    let rest = &url[8..];
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if auth.is_empty() || auth.contains('@') {
+        return None;
+    }
+    let lower = auth.to_ascii_lowercase();
+    Some(lower.strip_suffix(":443").unwrap_or(&lower).to_owned())
 }
 
 /// Per-project git environment.
@@ -91,8 +108,9 @@ pub fn explain(stderr: &str) -> String {
     }
 }
 
-/// Reads the credentials from env so they never hit `.git/config`, argv or the remote URL.
-const CREDENTIAL_HELPER: &str = r#"credential.helper=!f() { test "$1" = get && echo "username=$UNDERTREE_GIT_USERNAME" && echo "password=$UNDERTREE_GIT_TOKEN"; }; f"#;
+/// Reads host-scoped HTTPS credentials from env so tokens never leak to other hosts (e.g.
+/// submodules or cross-host redirects) and never hit `.git/config`, argv or the remote URL.
+const CREDENTIAL_HELPER: &str = r#"credential.helper=!f() { test "$1" = get || exit 0; proto=""; host=""; while IFS= read -r line; do case "$line" in protocol=*) proto=${line#protocol=} ;; host=*) host=${line#host=} ;; "") break ;; esac; done; host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]'); host=${host%:443}; if [ "$proto" = "https" ] && [ -n "$UNDERTREE_GIT_HOST" ] && [ "$host" = "$UNDERTREE_GIT_HOST" ]; then echo "username=$UNDERTREE_GIT_USERNAME"; echo "password=$UNDERTREE_GIT_TOKEN"; fi; }; f"#;
 
 /// `git <args>` in `dir`, never prompting. `-c` options reach submodule subprocesses too
 /// (git passes them on via GIT_CONFIG_PARAMETERS).
@@ -101,9 +119,12 @@ pub fn command(dir: &Path, args: &[&str], remote: &Remote) -> Command {
     // no host-level helper (e.g. ~/.git-credentials) may leak into any project
     cmd.args(["-c", "credential.helper="]);
     if let Some(c) = &remote.creds {
-        cmd.args(["-c", CREDENTIAL_HELPER])
-            .env("UNDERTREE_GIT_USERNAME", &c.username)
-            .env("UNDERTREE_GIT_TOKEN", &c.token);
+        if let Some(host) = &c.host {
+            cmd.args(["-c", CREDENTIAL_HELPER])
+                .env("UNDERTREE_GIT_HOST", host)
+                .env("UNDERTREE_GIT_USERNAME", &c.username)
+                .env("UNDERTREE_GIT_TOKEN", &c.token);
+        }
     }
     cmd.args(args)
         .current_dir(dir)
@@ -184,7 +205,7 @@ pub async fn stdout(dir: &Path, args: &[&str]) -> Option<String> {
 pub struct Locks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
 
 impl Locks {
-    fn get(&self, repo: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn get(&self, repo: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.0
             .lock()
             .unwrap()
@@ -201,7 +222,7 @@ impl Locks {
 /// Each entry carries the sequence number of its latest touch, so a commit clears only what
 /// happened before it looked (`mark`), never edits that arrive while it runs.
 #[derive(Default)]
-pub struct Contributions(Mutex<(u64, HashMap<String, Touches>)>);
+pub struct Contributions(Mutex<(u64, Option<Instant>, HashMap<String, Touches>)>);
 
 /// user id → sequence number of their latest touch
 type Touches = HashMap<i64, u64>;
@@ -213,28 +234,55 @@ fn covers(touched: &str, changed: &str) -> bool {
 
 impl Contributions {
     pub fn touch(&self, path: &str, uid: i64) {
-        let (seq, map) = &mut *self.0.lock().unwrap();
+        let (seq, last_touch, map) = &mut *self.0.lock().unwrap();
         *seq += 1;
+        *last_touch = Some(Instant::now());
         map.entry(path.into()).or_default().insert(uid, *seq);
     }
 
+    pub fn last_touch(&self) -> Option<Instant> {
+        self.0.lock().unwrap().1
+    }
+
     /// Current position; pass it to `clear` to keep everything touched afterwards.
-    fn mark(&self) -> u64 {
+    pub(crate) fn mark(&self) -> u64 {
         self.0.lock().unwrap().0
     }
 
     /// Users who touched `changed` paths up to `upto` (`u64::MAX`: everything so far).
-    fn users(&self, changed: &[String], upto: u64) -> BTreeSet<i64> {
-        let (_, map) = &*self.0.lock().unwrap();
+    pub(crate) fn users(&self, changed: &[String], upto: u64) -> BTreeSet<i64> {
+        let (_, _, map) = &*self.0.lock().unwrap();
         map.iter()
             .filter(|(t, _)| changed.iter().any(|c| covers(t, c)))
             .flat_map(|(_, users)| users.iter().filter(|(_, s)| **s <= upto).map(|(u, _)| *u))
             .collect()
     }
 
+    /// Distinct user ids who touched `changed` up to `upto`, most recently active first.
+    pub(crate) fn ordered_users(&self, changed: &[String], upto: u64) -> Vec<i64> {
+        let (_, _, map) = &*self.0.lock().unwrap();
+        let mut latest: HashMap<i64, u64> = HashMap::new();
+        for (t, users) in map {
+            if !changed.iter().any(|c| covers(t, c)) {
+                continue;
+            }
+            for (&uid, &s) in users {
+                if s <= upto {
+                    latest
+                        .entry(uid)
+                        .and_modify(|prev| *prev = (*prev).max(s))
+                        .or_insert(s);
+                }
+            }
+        }
+        let mut out: Vec<(i64, u64)> = latest.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.into_iter().map(|(uid, _)| uid).collect()
+    }
+
     /// Forgets touches of `changed` paths up to `upto`.
-    fn clear(&self, changed: &[String], upto: u64) {
-        let (_, map) = &mut *self.0.lock().unwrap();
+    pub(crate) fn clear(&self, changed: &[String], upto: u64) {
+        let (_, _, map) = &mut *self.0.lock().unwrap();
         map.retain(|t, users| {
             if changed.iter().any(|c| covers(t, c)) {
                 users.retain(|_, s| *s > upto);
@@ -245,7 +293,7 @@ impl Contributions {
 }
 
 /// Host of an `https://`, `ssh://` or scp-style (`git@host:path`) remote is github.com.
-fn is_github(url: &str) -> bool {
+pub(crate) fn is_github(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split('/').next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or("");
@@ -279,9 +327,9 @@ pub fn ident_name(u: &User) -> String {
     sanitize_ident_name(&u.display_name)
 }
 
-type IdentityOverride = (Option<String>, Option<String>);
+pub(crate) type IdentityOverride = (Option<String>, Option<String>);
 
-async fn project_identities(
+pub(crate) async fn project_identities(
     db: &SqlitePool,
     pid: i64,
 ) -> Result<HashMap<i64, IdentityOverride>, ApiError> {
@@ -299,20 +347,27 @@ async fn project_identities(
         .collect())
 }
 
-fn effective_name(u: &User, ov: Option<&IdentityOverride>) -> String {
+pub(crate) fn effective_name(u: &User, ov: Option<&IdentityOverride>) -> String {
     ov.and_then(|(n, _)| n.as_deref())
         .map(sanitize_ident_name)
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| ident_name(u))
 }
 
-fn effective_email(u: &User, ov: Option<&IdentityOverride>, github_remote: bool) -> String {
+pub(crate) fn effective_email(
+    u: &User,
+    ov: Option<&IdentityOverride>,
+    github_remote: bool,
+) -> String {
     ov.and_then(|(_, e)| e.clone())
         .unwrap_or_else(|| author_email(u, github_remote))
 }
 
 /// Users with these ids, in a stable order.
-async fn users_by_id(db: &SqlitePool, ids: &BTreeSet<i64>) -> Result<Vec<User>, ApiError> {
+pub(crate) async fn users_by_id(
+    db: &SqlitePool,
+    ids: &BTreeSet<i64>,
+) -> Result<Vec<User>, ApiError> {
     sqlx::query_as(select_user!(
         "id IN (SELECT value FROM json_each(?)) ORDER BY display_name, username"
     ))
@@ -348,22 +403,25 @@ async fn project_users(db: &SqlitePool, pid: i64, names: &[String]) -> Result<Ve
     Ok(users)
 }
 
-struct Git {
+pub(crate) struct Git {
     output: Output,
 }
 
 impl Git {
-    fn ok(&self) -> bool {
+    pub(crate) fn ok(&self) -> bool {
         self.output.status.success()
     }
-    fn stdout(&self) -> String {
+    pub(crate) fn stdout_bytes(&self) -> &[u8] {
+        &self.output.stdout
+    }
+    pub(crate) fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.output.stdout).into_owned()
     }
-    fn stderr(&self) -> String {
+    pub(crate) fn stderr(&self) -> String {
         String::from_utf8_lossy(&self.output.stderr).into_owned()
     }
     /// Successful run or `502 git_failed` with stderr.
-    fn check(self) -> Result<Self, ApiError> {
+    pub(crate) fn check(self) -> Result<Self, ApiError> {
         if self.ok() {
             Ok(self)
         } else {
@@ -379,7 +437,7 @@ impl Git {
     }
 }
 
-async fn git(
+pub(crate) async fn git(
     app: &Project,
     dir: &Path,
     args: &[&str],
@@ -398,7 +456,7 @@ async fn git(
 }
 
 /// Local git run against a separate index file (`GIT_INDEX_FILE`); no remote access.
-async fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<Git, ApiError> {
+pub(crate) async fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<Git, ApiError> {
     let output = command(dir, args, &Remote::default())
         .env("GIT_INDEX_FILE", index)
         .output()
@@ -408,7 +466,7 @@ async fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<Git, ApiEr
 }
 
 /// Parent repo (`""`) or an initialized submodule; anything else is 400.
-async fn repo_dir(app: &Project, repo: &str) -> Result<PathBuf, ApiError> {
+pub(crate) async fn repo_dir(app: &Project, repo: &str) -> Result<PathBuf, ApiError> {
     let known = app
         .workspace
         .repos()
@@ -433,6 +491,7 @@ async fn repo_dir(app: &Project, repo: &str) -> Result<PathBuf, ApiError> {
 
 /// Workspace-relative `path` → path relative to `repo` (must lie inside it).
 fn repo_relative<'a>(app: &Project, repo: &str, path: &'a str) -> Result<&'a str, ApiError> {
+    let path = path.strip_suffix('/').unwrap_or(path);
     app.workspace.resolve(path)?;
     if repo.is_empty() {
         return Ok(path);
@@ -443,7 +502,7 @@ fn repo_relative<'a>(app: &Project, repo: &str, path: &'a str) -> Result<&'a str
     }
 }
 
-fn prefixed(repo: &str, path: &str) -> String {
+pub(crate) fn prefixed(repo: &str, path: &str) -> String {
     if repo.is_empty() {
         path.to_owned()
     } else {
@@ -462,23 +521,23 @@ pub struct RepoQuery {
 
 #[derive(Serialize, Debug, PartialEq)]
 pub struct FileStatus {
-    path: String,
-    index: String,
-    worktree: String,
+    pub(crate) path: String,
+    pub(crate) index: String,
+    pub(crate) worktree: String,
 }
 
 #[derive(Serialize, Debug, PartialEq, Default)]
 pub struct GitStatus {
-    repo: String,
-    branch: Option<String>,
-    upstream: Option<String>,
-    ahead: u32,
-    behind: u32,
-    files: Vec<FileStatus>,
+    pub(crate) repo: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) upstream: Option<String>,
+    pub(crate) ahead: u32,
+    pub(crate) behind: u32,
+    pub(crate) files: Vec<FileStatus>,
 }
 
 /// Parses `git status --porcelain=v2 --branch -z`; XY codes are reported v1-style (`.` → ` `).
-fn parse_status(repo: &str, out: &str) -> GitStatus {
+pub(crate) fn parse_status(repo: &str, out: &str) -> GitStatus {
     let mut st = GitStatus {
         repo: repo.into(),
         ..Default::default()
@@ -505,11 +564,14 @@ fn parse_status(repo: &str, out: &str) -> GitStatus {
                 .and_then(|b| b.trim_start_matches('-').parse().ok())
                 .unwrap_or(0);
         } else if let Some(path) = rec.strip_prefix("? ") {
-            st.files.push(FileStatus {
-                path: prefixed(repo, path),
-                index: "?".into(),
-                worktree: "?".into(),
-            });
+            let path = path.strip_suffix('/').unwrap_or(path);
+            if !path.is_empty() {
+                st.files.push(FileStatus {
+                    path: prefixed(repo, path),
+                    index: "?".into(),
+                    worktree: "?".into(),
+                });
+            }
         } else {
             // "1 XY sub mH mI mW hH hI path" | "2 XY sub mH mI mW hH hI Xscore path\0orig" |
             // "u XY sub m1 m2 m3 mW h1 h2 h3 path"
@@ -546,7 +608,13 @@ pub async fn status(
     let out = git(
         &app,
         &dir,
-        &["status", "--porcelain=v2", "--branch", "-z"],
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+            "-z",
+        ],
         None,
     )
     .await?
@@ -883,7 +951,7 @@ pub struct RepoBody {
     repo: String,
 }
 
-fn is_non_fast_forward(stderr: &str) -> bool {
+pub(crate) fn is_non_fast_forward(stderr: &str) -> bool {
     [
         "Not possible to fast-forward",
         "[rejected]",
@@ -984,7 +1052,8 @@ mod tests {
                    1 A. N... 000000 100644 100644 000 ccc new dir/file.tex\0\
                    2 R. N... 100644 100644 100644 ddd ddd R100 b.tex\0a.tex\0\
                    1 .M SC.. 160000 160000 160000 eee fff sub\0\
-                   ? notes.txt\0";
+                   ? notes.txt\0\
+                   ? nested-dir/\0";
         let st = parse_status("papers/a", out);
         assert_eq!(st.branch.as_deref(), Some("main"));
         assert_eq!(st.upstream.as_deref(), Some("origin/main"));
@@ -1002,6 +1071,7 @@ mod tests {
                 ("papers/a/b.tex", "R", " "),
                 ("papers/a/sub", " ", "M"),
                 ("papers/a/notes.txt", "?", "?"),
+                ("papers/a/nested-dir", "?", "?"),
             ]
         );
         let detached = parse_status("", "# branch.head (detached)\0");
@@ -1013,6 +1083,7 @@ mod tests {
             creds: Some(Creds {
                 username: "oauth2".into(),
                 token: "tok-123".into(),
+                host: Some("gitlab.com".into()),
             }),
             allow_file,
             ssh: None,
@@ -1033,6 +1104,7 @@ mod tests {
             .get_envs()
             .map(|(k, v)| (k.to_str().unwrap(), v.and_then(|v| v.to_str())))
             .collect();
+        assert_eq!(env["UNDERTREE_GIT_HOST"], Some("gitlab.com"));
         assert_eq!(env["UNDERTREE_GIT_TOKEN"], Some("tok-123"));
         assert_eq!(env["UNDERTREE_GIT_USERNAME"], Some("oauth2"));
         assert_eq!(env["GIT_ALLOW_PROTOCOL"], Some("https:ssh"));
@@ -1155,21 +1227,37 @@ mod tests {
     async fn credential_helper_answers_git() {
         use tokio::io::AsyncWriteExt;
         let dir = tempfile::tempdir().unwrap();
-        let mut child = command(dir.path(), &["credential", "fill"], &with_creds(false))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        stdin
-            .write_all(b"protocol=https\nhost=gitlab.com\n\n")
-            .await
-            .unwrap();
-        drop(stdin);
-        let out = child.wait_with_output().await.unwrap();
-        let out = String::from_utf8_lossy(&out.stdout);
-        assert!(out.contains("username=oauth2\n"), "{out}");
-        assert!(out.contains("password=tok-123\n"), "{out}");
+        let run_fill = |input: &'static [u8]| {
+            let p = dir.path().to_owned();
+            async move {
+                let mut child = command(&p, &["credential", "fill"], &with_creds(false))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(input).await.unwrap();
+                drop(stdin);
+                let out = child.wait_with_output().await.unwrap();
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }
+        };
+
+        let ok = run_fill(b"protocol=https\nhost=GitLab.com:443\n\n").await;
+        assert!(ok.contains("username=oauth2\n"), "{ok}");
+        assert!(ok.contains("password=tok-123\n"), "{ok}");
+
+        let wrong_host = run_fill(b"protocol=https\nhost=evil.example\n\n").await;
+        assert!(
+            !wrong_host.contains("tok-123"),
+            "leaked token: {wrong_host}"
+        );
+
+        let wrong_proto = run_fill(b"protocol=http\nhost=gitlab.com\n\n").await;
+        assert!(
+            !wrong_proto.contains("tok-123"),
+            "leaked token: {wrong_proto}"
+        );
     }
 
     #[test]

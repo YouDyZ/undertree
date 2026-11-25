@@ -4139,6 +4139,31 @@ a.badge,
   margin-top: 2px;
 }
 
+.repo-match-hint {
+  color: var(--accent);
+}
+
+.repo-scan-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 12.5px;
+}
+
+.repo-scan-box.is-warn {
+  border-color: var(--alert-warn-border, var(--border-strong));
+}
+
+.repo-scan-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 /* --- Comments (#54) --- */
 .cm-editor-stage {
   position: relative;
@@ -4649,3 +4674,71 @@ a.badge,
   font-size: 12px;
   border-top: 1px solid var(--border);
 }
+
+/* --- Auto-Push & Commit Reminder (#77) --- */
+.git-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-elev);
+}
+
+.git-status-dot.is-error {
+  background: var(--danger);
+}
+
+.git-autopush-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  font-size: 11.5px;
+}
+
+.git-autopush-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.git-autopush-err {
+  margin: 0;
+  padding: 6px 8px;
+  font-size: 11.5px;
+}
+
+.git-reminder-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 12.5px;
+}
+
+.git-reminder-banner.is-error {
+  border-bottom-color: var(--danger);
+}
+
+.git-reminder-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.git-reminder-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+

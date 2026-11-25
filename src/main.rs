@@ -2,6 +2,7 @@ mod accounts;
 mod admin;
 mod anonymize;
 mod auth;
+mod autopush;
 mod chat;
 mod ci;
 mod cli;
@@ -179,6 +180,10 @@ async fn build_with_state(
         let every = std::time::Duration::from_secs(cfg.zotero_sync_secs);
         tokio::spawn(zotero::sync_loop(state.clone(), every));
     }
+    if cfg.auto_push_poll_secs > 0 {
+        let every = std::time::Duration::from_secs(cfg.auto_push_poll_secs);
+        tokio::spawn(autopush::sync_loop(state.clone(), every));
+    }
     tokio::spawn(
         store
             .clone()
@@ -213,6 +218,7 @@ async fn build_with_state(
             get(zotero::collections),
         )
         .route("/api/projects", get(projects::list).post(projects::create))
+        .route("/api/projects/scan", post(projects::scan))
         .route(
             "/api/templates",
             get(templates::list)
@@ -329,6 +335,7 @@ async fn build_with_state(
             axum::routing::patch(git::patch_identity),
         )
         .route("/api/projects/{pid}/git/commit", post(git::commit))
+        .route("/api/projects/{pid}/git/auto-push", post(autopush::trigger))
         .route("/api/projects/{pid}/git/pull", post(git::pull))
         .route("/api/projects/{pid}/git/push", post(git::push))
         .route(
@@ -412,6 +419,7 @@ mod tests {
             github_api_url: "https://api.github.com".into(),
             zotero_api_url: "https://api.zotero.org".into(),
             zotero_sync_secs: 0,
+            auto_push_poll_secs: 0,
             gitlab_hosts: vec![],
             languagetool_url: None,
         }
@@ -1769,6 +1777,85 @@ mod tests {
             name.to_string_lossy().starts_with("undertree-commit")
         });
         assert_eq!(leftovers.count(), 0, "temporary index files are removed");
+    }
+
+    #[tokio::test]
+    async fn git_status_and_commit_untracked_subdirectories() {
+        let (_tmp, parent) = workspace::tests::fixture();
+        let (app, c, _) = with_project(&parent).await;
+
+        for (p, content) in [
+            ("abbildungen/.gitkeep", ""),
+            ("kapitel/einleitung.tex", "Einleitung\n"),
+            ("kapitel/grundlagen.tex", "Grundlagen\n"),
+        ] {
+            let url = format!("/api/projects/1/files/{p}");
+            assert_eq!(call(&app, req("PUT", &url, &c, content)).await.0, 204);
+        }
+
+        let (status, _, st) = call(&app, get("/api/projects/1/git/status?repo=", Some(&c))).await;
+        assert_eq!(status, 200, "{st}");
+        let mut paths: Vec<&str> = (st["files"].as_array().unwrap().iter())
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "abbildungen/.gitkeep",
+                "kapitel/einleitung.tex",
+                "kapitel/grundlagen.tex",
+            ]
+        );
+
+        let (status, _, body) = call(
+            &app,
+            post_json(
+                "/api/projects/1/git/commit",
+                &c,
+                json!({
+                    "repo": "",
+                    "message": "add abbildungen",
+                    "paths": ["abbildungen/.gitkeep"],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        // Defensive: a trailing slash on a valid subdir path is accepted cleanly, while unsafe
+        // trailing-slash paths still fail with 400 invalid_path.
+        let (status, _, body) = call(
+            &app,
+            post_json(
+                "/api/projects/1/git/commit",
+                &c,
+                json!({
+                    "repo": "",
+                    "message": "add kapitel via trailing slash",
+                    "paths": ["kapitel/"],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        for bad in [".git/", "/", "kapitel//", "../escape/"] {
+            let (status, _, err) = call(
+                &app,
+                post_json(
+                    "/api/projects/1/git/commit",
+                    &c,
+                    json!({ "repo": "", "message": "bad", "paths": [bad] }),
+                ),
+            )
+            .await;
+            assert_eq!(
+                (status, err["error"]["code"].as_str()),
+                (400, Some("invalid_path")),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3785,6 +3872,282 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn auto_push_patch_validation_and_trigger() {
+            use workspace::tests::git;
+            let tmp = tempfile::tempdir().unwrap();
+            let t = tmp.path();
+            git(t, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+            git(t, &["clone", "-q", "remote.git", "seed"]);
+            let seed = t.join("seed");
+            std::fs::write(seed.join("main.tex"), "hello\n").unwrap();
+            git(&seed, &["add", "."]);
+            git(&seed, &["commit", "-qm", "init"]);
+            git(&seed, &["push", "-q", "-u", "origin", "main"]);
+
+            let (app, alice, _ws) = with_project(&t.join("remote.git")).await;
+            let add_bob = post_json(
+                "/api/projects/1/members",
+                &alice,
+                json!({ "username": "bob", "role": "viewer" }),
+            );
+            assert_eq!(call(&app, add_bob).await.0, 201);
+            let bob = cookie_of(&app, "bob").await;
+
+            // Validation on PATCH
+            for bad in [-1, 1, 59, 86_401] {
+                let (status, _, _) = call(
+                    &app,
+                    json_req(
+                        "PATCH",
+                        "/api/projects/1",
+                        &alice,
+                        json!({ "auto_push_interval_secs": bad }),
+                    ),
+                )
+                .await;
+                assert_eq!(status, 400, "interval {bad}");
+            }
+            let (status, _, patched) = call(
+                &app,
+                json_req(
+                    "PATCH",
+                    "/api/projects/1",
+                    &alice,
+                    json!({
+                        "auto_push_interval_secs": 300,
+                        "auto_push_message": "Auto: {files} ({count})"
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, 200, "{patched}");
+            assert_eq!(patched["auto_push_interval_secs"], 300);
+            assert_eq!(patched["auto_push_message"], "Auto: {files} ({count})");
+
+            // Viewer may not trigger auto-push
+            let (status, _, _) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &bob, json!({})),
+            )
+            .await;
+            assert_eq!(status, 403);
+
+            // Edit file -> auto-push commits + pushes cleanly
+            assert_eq!(
+                call(
+                    &app,
+                    req("PUT", "/api/projects/1/files/paper.tex", &alice, "body\n")
+                )
+                .await
+                .0,
+                204
+            );
+            let (status, _, res) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &alice, json!({})),
+            )
+            .await;
+            assert_eq!(status, 200, "{res}");
+            assert_eq!(res["pushed"], true);
+            assert!(res["sha"].as_str().is_some_and(|s| s.len() >= 7));
+            assert!(res["auto_push_last_at"].is_string());
+            assert!(res["auto_push_last_error"].is_null());
+
+            let msg = std::process::Command::new("git")
+                .args(["log", "-1", "--format=%s"])
+                .current_dir(t.join("remote.git"))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&msg.stdout).trim(),
+                "Auto: paper.tex (1)"
+            );
+
+            // Second trigger without changes is a no-op
+            let (status, _, res2) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &alice, json!({})),
+            )
+            .await;
+            assert_eq!(status, 200, "{res2}");
+            assert_eq!(res2["pushed"], false);
+        }
+
+        #[tokio::test]
+        async fn auto_push_two_users_same_file_no_conflict() {
+            use workspace::tests::git;
+            let tmp = tempfile::tempdir().unwrap();
+            let t = tmp.path();
+            git(t, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+            git(t, &["clone", "-q", "remote.git", "seed"]);
+            let seed = t.join("seed");
+            std::fs::write(seed.join("shared.tex"), "line1\nline2\nline3\n").unwrap();
+            git(&seed, &["add", "."]);
+            git(&seed, &["commit", "-qm", "init"]);
+            git(&seed, &["push", "-q", "-u", "origin", "main"]);
+
+            let (app, alice, _ws) = with_project(&t.join("remote.git")).await;
+            let add_bob = post_json(
+                "/api/projects/1/members",
+                &alice,
+                json!({ "username": "bob", "role": "editor" }),
+            );
+            assert_eq!(call(&app, add_bob).await.0, 201);
+            let bob = cookie_of(&app, "bob").await;
+
+            let addr = serve(app.clone()).await;
+            let mut a = Client::connect(addr, "shared.tex", &alice).await;
+            let mut b = Client::connect(addr, "shared.tex", &bob).await;
+            a.until(|text| text == "line1\nline2\nline3\n").await;
+            b.until(|text| text == "line1\nline2\nline3\n").await;
+
+            a.insert(0, "alice ").await;
+            b.until(|text| text.starts_with("alice ")).await;
+            let end = b.text().len() as u32;
+            b.insert(end, "bob end\n").await;
+            let expected = "alice line1\nline2\nline3\nbob end\n";
+            a.until(|text| text == expected).await;
+
+            let (status, _, res) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &alice, json!({})),
+            )
+            .await;
+            assert_eq!(status, 200, "{res}");
+            assert_eq!(res["pushed"], true);
+
+            let remote = t.join("remote.git");
+            let show = std::process::Command::new("git")
+                .args(["show", "HEAD:shared.tex"])
+                .current_dir(&remote)
+                .output()
+                .unwrap();
+            let remote_text = String::from_utf8_lossy(&show.stdout);
+            assert_eq!(remote_text, expected);
+            assert!(!remote_text.contains("<<<<<<<"));
+
+            let log = std::process::Command::new("git")
+                .args(["log", "-1", "--format=%an|%B"])
+                .current_dir(&remote)
+                .output()
+                .unwrap();
+            let log_s = String::from_utf8_lossy(&log.stdout);
+            assert!(
+                log_s.starts_with("Bob|"),
+                "last active editor should author: {log_s}"
+            );
+            assert!(
+                log_s.contains("Co-authored-by: Alice <a@x.org>"),
+                "other editor should be Co-authored-by: {log_s}"
+            );
+        }
+
+        #[tokio::test]
+        async fn auto_push_merges_non_conflicting_remote_and_aborts_real_conflict() {
+            use workspace::tests::git;
+            let tmp = tempfile::tempdir().unwrap();
+            let t = tmp.path();
+            git(t, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+            git(t, &["clone", "-q", "remote.git", "seed"]);
+            git(t, &["clone", "-q", "remote.git", "other"]);
+            let (seed, other) = (t.join("seed"), t.join("other"));
+            std::fs::write(seed.join("paper.tex"), "alpha\nbeta\ngamma\ndelta\n").unwrap();
+            git(&seed, &["add", "."]);
+            git(&seed, &["commit", "-qm", "init"]);
+            git(&seed, &["push", "-q", "-u", "origin", "main"]);
+
+            let (app, alice, ws) = with_project(&t.join("remote.git")).await;
+            let addr = serve(app.clone()).await;
+            let mut a = Client::connect(addr, "paper.tex", &alice).await;
+            a.until(|text| text == "alpha\nbeta\ngamma\ndelta\n").await;
+
+            // Non-conflicting change on remote vs local top line
+            git(&other, &["pull", "-q"]);
+            std::fs::write(
+                other.join("paper.tex"),
+                "alpha\nbeta\ngamma\ndelta remote\n",
+            )
+            .unwrap();
+            git(&other, &["commit", "-qam", "remote bottom"]);
+            git(&other, &["push", "-q"]);
+
+            a.insert(0, "local top ").await;
+            a.until(|text| text.starts_with("local top ")).await;
+
+            let (status, _, res) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &alice, json!({})),
+            )
+            .await;
+            assert_eq!(status, 200, "{res}");
+            assert_eq!(res["pushed"], true);
+            let merged_expected = "local top alpha\nbeta\ngamma\ndelta remote\n";
+            a.until(|text| text == merged_expected).await;
+            assert_eq!(
+                std::fs::read_to_string(ws.join("paper.tex")).unwrap(),
+                merged_expected
+            );
+
+            // Real overlapping conflict on same line: must abort cleanly with 409 and no markers
+            git(&other, &["pull", "-q"]);
+            std::fs::write(
+                other.join("paper.tex"),
+                "REMOTE WIN\nbeta\ngamma\ndelta remote\n",
+            )
+            .unwrap();
+            git(&other, &["commit", "-qam", "remote top"]);
+            git(&other, &["push", "-q"]);
+
+            a.insert(0, "LOCAL WIN ").await;
+            a.until(|text| text.starts_with("LOCAL WIN ")).await;
+
+            let (status, _, err) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &alice, json!({})),
+            )
+            .await;
+            assert_eq!(status, 409, "{err}");
+            assert!(!ws.join(".git/MERGE_HEAD").exists());
+            let disk = std::fs::read_to_string(ws.join("paper.tex")).unwrap();
+            assert!(!disk.contains("<<<<<<<"), "{disk}");
+
+            let (_, _, proj) = call(&app, get("/api/projects/1", Some(&alice))).await;
+            assert!(proj["auto_push_last_error"].is_string());
+
+            let stash = std::process::Command::new("git")
+                .args(["stash", "list"])
+                .current_dir(&ws)
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&stash.stdout).trim().is_empty(),
+                "no autostash entries should remain"
+            );
+
+            // Detached HEAD with dirty changes produces an explicit error note instead of quiet ok
+            let head_sha = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&ws)
+                .output()
+                .unwrap();
+            git(
+                &ws,
+                &[
+                    "checkout",
+                    "-q",
+                    String::from_utf8_lossy(&head_sha.stdout).trim(),
+                ],
+            );
+            std::fs::write(ws.join("paper.tex"), "detached dirty\n").unwrap();
+            let (status, _, _) = call(
+                &app,
+                post_json("/api/projects/1/git/auto-push", &alice, json!({})),
+            )
+            .await;
+            assert_eq!(status, 409);
+        }
+
+        #[tokio::test]
         async fn commits_credit_every_editor() {
             let (_tmp, parent) = workspace::tests::fixture();
             let (app, alice, parent) = with_project(&parent).await;
@@ -5726,5 +6089,312 @@ mod tests {
             assert!(show(&bare, "main:chapters/einleitung.tex").contains(r"\chapter"));
             assert!(show(&bare, "main:.gitlab-ci.yml").contains("-lualatex"));
         }
+    }
+
+    #[tokio::test]
+    async fn scan_existing_repo_with_and_without_tex() {
+        use workspace::tests::git;
+        let (app, _) = test_app_state(test_cfg(true), true).await;
+        let c = cookie_of(&app, "alice").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+
+        // 1. Repo with LaTeX file
+        git(t, &["init", "-q", "--bare", "-b", "main", "with-tex.git"]);
+        git(t, &["clone", "-q", "with-tex.git", "seed-tex"]);
+        std::fs::write(
+            t.join("seed-tex/paper.tex"),
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\begin{document}Hi\\end{document}\n",
+        )
+        .unwrap();
+        git(&t.join("seed-tex"), &["add", "."]);
+        git(&t.join("seed-tex"), &["commit", "-qm", "add tex"]);
+        git(&t.join("seed-tex"), &["push", "-q", "-u", "origin", "main"]);
+
+        let (status, _, scan1) = call(
+            &app,
+            post_json(
+                "/api/projects/scan",
+                &c,
+                json!({ "remote_url": format!("file://{}", t.join("with-tex.git").display()) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{scan1}");
+        assert_eq!(scan1["branch"], "main");
+        assert_eq!(scan1["is_empty"], false);
+        assert_eq!(scan1["has_tex_files"], true);
+        assert_eq!(scan1["tex_files"], json!(["paper.tex"]));
+        assert_eq!(scan1["roots"], json!(["paper.tex"]));
+        assert_eq!(scan1["detected_compiler"], "xelatex");
+
+        // 2. Non-empty repo without any .tex files
+        git(t, &["init", "-q", "--bare", "-b", "main", "no-tex.git"]);
+        git(t, &["clone", "-q", "no-tex.git", "seed-notex"]);
+        std::fs::write(t.join("seed-notex/README.md"), "# Notes\n").unwrap();
+        git(&t.join("seed-notex"), &["add", "."]);
+        git(&t.join("seed-notex"), &["commit", "-qm", "readme"]);
+        git(
+            &t.join("seed-notex"),
+            &["push", "-q", "-u", "origin", "main"],
+        );
+
+        let (status, _, scan2) = call(
+            &app,
+            post_json(
+                "/api/projects/scan",
+                &c,
+                json!({ "remote_url": format!("file://{}", t.join("no-tex.git").display()) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{scan2}");
+        assert_eq!(scan2["is_empty"], false);
+        assert_eq!(scan2["file_count"], 1);
+        assert_eq!(scan2["has_tex_files"], false);
+        assert_eq!(scan2["tex_files"], json!([]));
+
+        // 3. Completely empty bare repository
+        git(t, &["init", "-q", "--bare", "-b", "main", "empty.git"]);
+        let (status, _, scan3) = call(
+            &app,
+            post_json(
+                "/api/projects/scan",
+                &c,
+                json!({ "remote_url": format!("file://{}", t.join("empty.git").display()) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{scan3}");
+        assert_eq!(scan3["is_empty"], true);
+        assert_eq!(scan3["file_count"], 0);
+        assert_eq!(scan3["has_tex_files"], false);
+    }
+
+    #[tokio::test]
+    async fn create_existing_repo_with_template_when_no_tex() {
+        use workspace::tests::git;
+        let (app, _) = test_app_state(test_cfg(true), true).await;
+        let c = cookie_of(&app, "alice").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+
+        // Non-empty repo without .tex (contains README.md that must NOT be overwritten)
+        git(
+            t,
+            &["init", "-q", "--bare", "-b", "main", "readme-only.git"],
+        );
+        git(t, &["clone", "-q", "readme-only.git", "seed"]);
+        std::fs::write(t.join("seed/README.md"), "Keep Me\n").unwrap();
+        git(&t.join("seed"), &["add", "."]);
+        git(&t.join("seed"), &["commit", "-qm", "init"]);
+        git(&t.join("seed"), &["push", "-q", "-u", "origin", "main"]);
+
+        let bare = t.join("readme-only.git");
+        let (status, _, proj) = call(
+            &app,
+            post_json(
+                "/api/projects",
+                &c,
+                json!({
+                    "name": "Initialized",
+                    "remote_url": format!("file://{}", bare.display()),
+                    "template_id": "builtin:article"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 201, "{proj}");
+
+        let readme = std::process::Command::new("git")
+            .args(["show", "main:README.md"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&readme.stdout), "Keep Me\n");
+        let main_tex = std::process::Command::new("git")
+            .args(["show", "main:main.tex"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&main_tex.stdout).contains("\\begin{document}"));
+
+        // Trying to apply a template again now that main.tex exists must fail with 400
+        let (status, _, err) = call(
+            &app,
+            post_json(
+                "/api/projects",
+                &c,
+                json!({
+                    "name": "Duplicate",
+                    "remote_url": format!("file://{}", bare.display()),
+                    "template_id": "builtin:article"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 400, "{err}");
+
+        // Completely empty repo without template_id -> 400; with template_id -> 201 and pushed
+        git(t, &["init", "-q", "--bare", "-b", "main", "empty.git"]);
+        let empty = t.join("empty.git");
+        let (status, _, err) = call(
+            &app,
+            post_json(
+                "/api/projects",
+                &c,
+                json!({
+                    "name": "EmptyNoTpl",
+                    "remote_url": format!("file://{}", empty.display())
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 400, "{err}");
+
+        let (status, _, proj2) = call(
+            &app,
+            post_json(
+                "/api/projects",
+                &c,
+                json!({
+                    "name": "EmptyWithTpl",
+                    "remote_url": format!("file://{}", empty.display()),
+                    "template_id": "builtin:report"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 201, "{proj2}");
+        let report_tex = std::process::Command::new("git")
+            .args(["show", "main:main.tex"])
+            .current_dir(&empty)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&report_tex.stdout).contains("{report}"));
+    }
+
+    #[tokio::test]
+    async fn create_with_template_refuses_symlinks_outside_repo() {
+        use workspace::tests::git;
+        let (app, _) = test_app_state(test_cfg(true), true).await;
+        let c = cookie_of(&app, "alice").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let escaped_file = outside.path().join("pwned.tex");
+        let t = tmp.path();
+
+        git(t, &["init", "-q", "--bare", "-b", "main", "sym.git"]);
+        git(t, &["clone", "-q", "sym.git", "seed"]);
+        std::os::unix::fs::symlink(&escaped_file, t.join("seed/main.tex")).unwrap();
+        git(&t.join("seed"), &["add", "main.tex"]);
+        git(&t.join("seed"), &["commit", "-qm", "symlink"]);
+        git(&t.join("seed"), &["push", "-q", "-u", "origin", "main"]);
+
+        let (status, _, err) = call(
+            &app,
+            post_json(
+                "/api/projects",
+                &c,
+                json!({
+                    "name": "SymlinkTest",
+                    "remote_url": format!("file://{}", t.join("sym.git").display()),
+                    "template_id": "builtin:article"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, 400, "{err}");
+        assert!(
+            !escaped_file.exists(),
+            "template wrote outside the cloned repo!"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_reuses_matching_account_token() {
+        let (_app, state) = test_app_state(test_cfg(true), true).await;
+        let alice_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+
+        accounts::save(
+            &state,
+            alice_id,
+            accounts::Forge::Gitlab,
+            "https://git.dev.nighttime-gaming.de",
+            "alice-gl",
+            "glpat-saved-secret",
+        )
+        .await
+        .unwrap();
+        accounts::save(
+            &state,
+            alice_id,
+            accounts::Forge::Github,
+            "https://github.com",
+            "alice-gh",
+            "gho-saved-secret",
+        )
+        .await
+        .unwrap();
+
+        let gl = projects::resolve_connect_creds(
+            &state,
+            alice_id,
+            "https://git.dev.nighttime-gaming.de/studium/paper/os-paper.git",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(gl.used_auto_token);
+        assert_eq!(gl.username, "oauth2");
+        assert_eq!(gl.token.as_deref(), Some("glpat-saved-secret"));
+        assert_eq!(
+            gl.matched_account.as_ref().map(|m| m.login.as_str()),
+            Some("alice-gl")
+        );
+
+        let gh = projects::resolve_connect_creds(
+            &state,
+            alice_id,
+            "https://github.com/alice/paper.git",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(gh.used_auto_token);
+        assert_eq!(gh.username, "x-access-token");
+        assert_eq!(gh.token.as_deref(), Some("gho-saved-secret"));
+
+        // Explicit manual token overrides stored account token
+        let manual = projects::resolve_connect_creds(
+            &state,
+            alice_id,
+            "https://git.dev.nighttime-gaming.de/studium/paper/os-paper.git",
+            None,
+            Some("glpat-manual".into()),
+        )
+        .await
+        .unwrap();
+        assert!(!manual.used_auto_token);
+        assert_eq!(manual.token.as_deref(), Some("glpat-manual"));
+        assert!(manual.matched_account.is_none());
+
+        // Different host does not match
+        let other = projects::resolve_connect_creds(
+            &state,
+            alice_id,
+            "https://gitlab.com/someone/paper.git",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!other.used_auto_token);
+        assert!(other.token.is_none());
     }
 }

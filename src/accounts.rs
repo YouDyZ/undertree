@@ -50,6 +50,107 @@ pub fn remote_failed(msg: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_GATEWAY, "remote_failed", msg)
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct MatchedAccountInfo {
+    pub id: i64,
+    pub provider: Forge,
+    pub base_url: String,
+    pub login: String,
+}
+
+pub struct MatchedCreds {
+    pub info: MatchedAccountInfo,
+    pub username: String,
+    pub token: String,
+}
+
+fn parse_https_url(url: &str) -> Option<(String, String)> {
+    let prefix = url.get(..8)?;
+    if !prefix.eq_ignore_ascii_case("https://") {
+        return None;
+    }
+    let rest = &url[8..];
+    let without_q = rest.split(['?', '#']).next().unwrap_or("");
+    let (auth, path) = match without_q.split_once('/') {
+        Some((a, p)) => (a, p),
+        None => (without_q, ""),
+    };
+    if auth.is_empty() || auth.contains('@') {
+        return None;
+    }
+    let auth_lower = auth.to_ascii_lowercase();
+    let norm_auth = auth_lower
+        .strip_suffix(":443")
+        .unwrap_or(&auth_lower)
+        .to_owned();
+    let norm_path = path.trim_matches('/').to_owned();
+    Some((norm_auth, norm_path))
+}
+
+/// True when an `https://` repository URL sits on the same host (default port normalized) and
+/// base path prefix as the stored account `base_url`.
+pub(crate) fn url_matches_account(remote_url: &str, base_url: &str) -> bool {
+    let Some((r_auth, r_path)) = parse_https_url(remote_url) else {
+        return false;
+    };
+    let Some((b_auth, b_path)) = parse_https_url(base_url) else {
+        return false;
+    };
+    if r_auth != b_auth {
+        return false;
+    }
+    b_path.is_empty() || r_path == b_path || r_path.starts_with(&format!("{b_path}/"))
+}
+
+/// Returns the first stored GitHub/GitLab account of `user_id` matching `remote_url`, with its
+/// decrypted token. Most specific `base_url` (longest prefix) wins.
+pub async fn match_for_url(
+    app: &AppState,
+    user_id: i64,
+    remote_url: &str,
+) -> Result<Option<MatchedCreds>, ApiError> {
+    if parse_https_url(remote_url).is_none() {
+        return Ok(None);
+    }
+    let rows: Vec<(i64, Forge, String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, provider, base_url, login, token_enc
+         FROM user_accounts
+         WHERE user_id = ? AND provider IN ('github', 'gitlab')
+         ORDER BY LENGTH(base_url) DESC, id ASC",
+    )
+    .bind(user_id)
+    .fetch_all(&app.db)
+    .await
+    .map_err(ApiError::internal)?;
+
+    for (id, provider, base_url, login, token_enc) in rows {
+        if !url_matches_account(remote_url, &base_url) {
+            continue;
+        }
+        let Some(token) = app.secrets.decrypt(&token_enc) else {
+            continue;
+        };
+        if token.is_empty() {
+            continue;
+        }
+        let username = match provider {
+            Forge::Github => "x-access-token".to_owned(),
+            Forge::Gitlab => "oauth2".to_owned(),
+        };
+        return Ok(Some(MatchedCreds {
+            info: MatchedAccountInfo {
+                id,
+                provider,
+                base_url,
+                login,
+            },
+            username,
+            token,
+        }));
+    }
+    Ok(None)
+}
+
 /// Stores the account (same user + provider + server: login and token are replaced).
 pub async fn save(
     app: &AppState,
@@ -608,5 +709,37 @@ mod tests {
         assert_eq!(enc("chair/papers"), "chair%2Fpapers");
         assert_eq!(enc("a.b_c-d~"), "a.b_c-d~");
         assert_eq!(enc("x y&z"), "x%20y%26z");
+    }
+
+    #[test]
+    fn account_url_matching() {
+        assert!(url_matches_account(
+            "https://git.dev.nighttime-gaming.de/studium/paper/os-paper.git",
+            "https://git.dev.nighttime-gaming.de"
+        ));
+        assert!(url_matches_account(
+            "https://GitLab.com:443/me/paper",
+            "https://gitlab.com"
+        ));
+        assert!(url_matches_account(
+            "https://git.uni.de/gitlab/group/repo.git",
+            "https://git.uni.de/gitlab"
+        ));
+        assert!(!url_matches_account(
+            "https://git.uni.de/gitlab2/group/repo.git",
+            "https://git.uni.de/gitlab"
+        ));
+        assert!(!url_matches_account(
+            "https://gitlab.com.evil.org/me/repo",
+            "https://gitlab.com"
+        ));
+        assert!(!url_matches_account(
+            "git@gitlab.com:me/repo.git",
+            "https://gitlab.com"
+        ));
+        assert!(!url_matches_account(
+            "https://user@gitlab.com/me/repo.git",
+            "https://gitlab.com"
+        ));
     }
 }
