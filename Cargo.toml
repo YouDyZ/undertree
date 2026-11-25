@@ -1,0 +1,38 @@
+[package]
+name = "undertree"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted collaborative LaTeX editor for Git-submodule based research repos"
+license-file = "LICENSE.md"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "multipart"] }
+axum-login = "0.19.0"
+base64 = "0.22"
+cap-std = "4.0.3"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+diffy = "0.5.2"
+landlock = "0.4"
+notify-debouncer-full = { version = "0.8.0", features = ["tokio"] }
+oauth2 = "5.0.0"
+rustix = { version = "1.1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "3.2.1"
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
+tower-sessions = "0.15.0"
+tower-sessions-sqlx-store = { version = "0.16.0", features = ["sqlite"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yrs = { version = "0.28.2", features = ["sync"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3.27.0"
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"

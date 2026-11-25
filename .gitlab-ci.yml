@@ -1,0 +1,81 @@
+stages:
+  - test
+  - deploy
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+
+rust:
+  stage: test
+  image: rust:1
+  tags:
+    - docker
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+  before_script:
+    - rustup component add clippy rustfmt
+  script:
+    - cargo fmt --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo test
+
+frontend:
+  stage: test
+  image: node:20
+  tags:
+    - docker
+  rules:
+    - exists:
+        - frontend/package.json
+    - when: never
+  cache:
+    key:
+      files:
+        - frontend/package-lock.json
+    paths:
+      - frontend/node_modules/
+  script:
+    - cd frontend
+    - npm ci
+    - npm run build
+
+# Deploys main to foundry (https://tex.dev.nighttime-gaming.de). Nginx Proxy Manager runs on
+# foundry too and reaches the app as http://undertree:3000 over the docker network caddynet,
+# so the container publishes no port. The job runs on the ntg-server runner, which reaches
+# foundry over WireGuard (DEPLOY_HOST=10.66.0.1). The key in DEPLOY_SSH_PRIVATE_KEY is pinned
+# on foundry to from="10.66.0.4",command="/usr/local/bin/deploy-undertree" (git reset to
+# origin/main, docker-compose up -d --build, health check), so the ssh call below runs exactly
+# that and nothing else. Server-local .env and docker-compose.override.yml live untracked in
+# /opt/undertree. Setup: issue #20.
+deploy_dev:
+  stage: deploy
+  image: alpine:3.20
+  tags:
+    - ntg-server
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  resource_group: deploy-dev
+  environment:
+    name: dev
+    url: https://tex.dev.nighttime-gaming.de
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+  script:
+    - ssh -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST"

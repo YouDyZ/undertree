@@ -1,0 +1,6 @@
+# Caddy fetches and renews the TLS certificate itself.
+# WebSockets (/ws/projects/{pid}/doc/*, /ws/projects/{pid}/events) work out of the box, no extra config needed.
+<DEINE-DOMAIN.TLD> {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000
+}

@@ -1,0 +1,8 @@
+/target
+/data
+/workspace
+frontend/node_modules
+frontend/dist
+.env
+/ssh
+/.claude/

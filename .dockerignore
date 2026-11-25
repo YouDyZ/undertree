@@ -1,0 +1,8 @@
+.git
+target
+data
+workspace
+ssh
+.env
+frontend/node_modules
+frontend/dist

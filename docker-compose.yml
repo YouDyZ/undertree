@@ -1,0 +1,26 @@
+services:
+  undertree:
+    build: .
+    image: undertree
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # never prompt (would hang a request); host keys must be in ./ssh/known_hosts
+      GIT_SSH_COMMAND: ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
+    ports:
+      - "127.0.0.1:3000:3000"          # only the reverse proxy on this host talks to it
+    volumes:
+      - ./data:/data                   # SQLite, secret.key, project clones, CRDT state, builds: back this up
+      - ./ssh:/home/undertree/.ssh:ro  # deploy key + known_hosts for git push
+
+  # Optional spell/grammar check (docs/DEPLOY.md → Spell check). Only started with the compose
+  # profile `spellcheck` (e.g. COMPOSE_PROFILES=spellcheck in .env); undertree uses it once
+  # UNDERTREE_LANGUAGETOOL_URL=http://languagetool:8010 is set. Internal network only.
+  languagetool:
+    image: erikvl87/languagetool:6.8
+    profiles: [spellcheck]
+    restart: unless-stopped
+    environment:
+      Java_Xms: 256m
+      Java_Xmx: 1g
+    mem_limit: 1536m
